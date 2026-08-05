@@ -1,0 +1,48 @@
+{
+  "color": [
+    {
+      "name": "start_window_background",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "theme_primary",
+      "value": "#1E88E5"
+    },
+    {
+      "name": "theme_bg",
+      "value": "#F5F6FA"
+    },
+    {
+      "name": "text_main",
+      "value": "#1A1A1A"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#8A8A8E"
+    },
+    {
+      "name": "player_bg",
+      "value": "#000000"
+    },
+    {
+      "name": "player_overlay",
+      "value": "#66000000"
+    },
+    {
+      "name": "card_bg",
+      "value": "#E8EAF0"
+    },
+    {
+      "name": "divider",
+      "value": "#E0E0E0"
+    },
+    {
+      "name": "poster_bg",
+      "value": "#2B2F3A"
+    },
+    {
+      "name": "white",
+      "value": "#FFFFFF"
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\liyah\\.ohos\\config\\default_NasPlayer_3CudkD8NtWJVzm0Qtfw36AtN8z-7CyUMG6ObQFvPjmI=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001A337DA40DE9BF06D1BA4E44E5BDF510E118CE3DFB8EE2520D640E3830AB039BAD93251B0D323A",
+          "profile": "C:\\Users\\liyah\\.ohos\\config\\default_NasPlayer_3CudkD8NtWJVzm0Qtfw36AtN8z-7CyUMG6ObQFvPjmI=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\liyah\\.ohos\\config\\default_NasPlayer_3CudkD8NtWJVzm0Qtfw36AtN8z-7CyUMG6ObQFvPjmI=.p12",
+          "storePassword": "0000001A38BE16EF0C8143B39BEE601005CC63D75EDCDC322BAD815858A2470D1CDADCDB85FA6C052285"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "targetSdkVersion": "6.1.1(24)",
+        "compatibleSdkVersion": "6.1.1(24)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

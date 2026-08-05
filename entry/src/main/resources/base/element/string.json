@@ -1,0 +1,176 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "NasPlayer"
+    },
+    {
+      "name": "app_name",
+      "value": "NasPlayer"
+    },
+    {
+      "name": "title_config",
+      "value": "NAS 连接配置"
+    },
+    {
+      "name": "label_host",
+      "value": "主机地址"
+    },
+    {
+      "name": "label_port",
+      "value": "端口"
+    },
+    {
+      "name": "label_share",
+      "value": "共享名"
+    },
+    {
+      "name": "label_username",
+      "value": "用户名"
+    },
+    {
+      "name": "label_password",
+      "value": "密码"
+    },
+    {
+      "name": "label_domain",
+      "value": "域 / 工作组"
+    },
+    {
+      "name": "btn_connect",
+      "value": "连接并浏览"
+    },
+    {
+      "name": "btn_save",
+      "value": "保存配置"
+    },
+    {
+      "name": "hint_host",
+      "value": "例如 192.168.1.100 或 nas.local"
+    },
+    {
+      "name": "hint_share",
+      "value": "例如 video 或 public"
+    },
+    {
+      "name": "hint_username",
+      "value": "共享账号"
+    },
+    {
+      "name": "hint_password",
+      "value": "共享密码"
+    },
+    {
+      "name": "toast_connecting",
+      "value": "正在连接…"
+    },
+    {
+      "name": "toast_saved",
+      "value": "配置已保存"
+    },
+    {
+      "name": "toast_connect_fail",
+      "value": "连接失败，请检查主机、账号与共享名"
+    },
+    {
+      "name": "toast_auth_fail",
+      "value": "认证失败，请检查用户名或密码"
+    },
+    {
+      "name": "toast_share_not_found",
+      "value": "共享不存在或无权访问"
+    },
+    {
+      "name": "toast_empty_dir",
+      "value": "目录为空"
+    },
+    {
+      "name": "toast_no_video",
+      "value": "当前目录没有可播放的视频"
+    },
+    {
+      "name": "toast_first_video",
+      "value": "已经是第一部视频"
+    },
+    {
+      "name": "toast_last_video",
+      "value": "已经是最后一部视频"
+    },
+    {
+      "name": "toast_play_error",
+      "value": "播放失败，请确认视频格式受支持"
+    },
+    {
+      "name": "toast_conn_lost",
+      "value": "连接已断开"
+    },
+    {
+      "name": "label_loading",
+      "value": "加载中…"
+    },
+    {
+      "name": "label_retry",
+      "value": "重试"
+    },
+    {
+      "name": "label_back",
+      "value": "返回"
+    },
+    {
+      "name": "label_view_list",
+      "value": "列表"
+    },
+    {
+      "name": "label_view_grid",
+      "value": "海报墙"
+    },
+    {
+      "name": "label_next",
+      "value": "下一部"
+    },
+    {
+      "name": "label_prev",
+      "value": "上一部"
+    },
+    {
+      "name": "label_browser_title",
+      "value": "文件浏览"
+    },
+    {
+      "name": "label_player_title",
+      "value": "播放中"
+    },
+    {
+      "name": "label_folder",
+      "value": "文件夹"
+    },
+    {
+      "name": "label_video",
+      "value": "视频"
+    },
+    {
+      "name": "label_play_completed",
+      "value": "播放完成"
+    },
+    {
+      "name": "label_up_switch",
+      "value": "上滑切换下一部"
+    },
+    {
+      "name": "label_down_switch",
+      "value": "下滑切换上一部"
+    },
+    {
+      "name": "label_speed",
+      "value": "倍速"
+    }
+  ]
+}
