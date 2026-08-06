@@ -40,7 +40,25 @@ export class SmbStatus {
       return '路径不存在';
     }
     if (status === SmbStatus.INVALID_PARAMETER) {
-      return '服务器拒绝请求（可能不支持 SMB3.1.1，请联系 NAS 开启 SMB2/3）';
+      return '服务器拒绝请求（可能不支持 SMB3.1.1）';
+    }
+    if (status === 0xc0000072) {
+      return '账户已被禁用';
+    }
+    if (status === 0xc0000071) {
+      return '密码已过期';
+    }
+    if (status === 0xc000015b) {
+      return '不允许使用该登录方式';
+    }
+    if (status === 0xc0000203) {
+      return '会话已失效';
+    }
+    if (status === 0xc0000184) {
+      return '协议状态错误（预认证校验失败）';
+    }
+    if (status === 0xc00000bb) {
+      return '服务器不支持该请求';
     }
     return 'SMB 错误 0x' + (status >>> 0).toString(16).toUpperCase();
   }
@@ -71,6 +89,11 @@ export class ByteWriter {
 
   u16le(v: number): void {
     this.dv.setUint16(this.pos, v & 0xffff, true);
+    this.pos += 2;
+  }
+
+  u16be(v: number): void {
+    this.dv.setUint16(this.pos, v & 0xffff, false);
     this.pos += 2;
   }
 
@@ -161,7 +184,8 @@ export interface SmbHeader {
   command: number;
   status: number;
   messageId: number;
-  sessionId: number;
+  sessionIdLo: number;
+  sessionIdHi: number;
   treeId: number;
   flags: number;
 }
@@ -169,8 +193,8 @@ export interface SmbHeader {
 export class SmbPacket {
   static readonly FLAG_SIGNED = 0x00000008;
 
-  static build(command: number, messageId: number, sessionId: number, treeId: number,
-    processId: number, flags: number, body: Uint8Array): Uint8Array {
+  static build(command: number, messageId: number, sessionIdLo: number, sessionIdHi: number,
+    treeId: number, processId: number, flags: number, body: Uint8Array): Uint8Array {
     const w = new ByteWriter(SMB2_HEADER_LEN + body.length);
     w.bytes(new Uint8Array([0xfe, 0x53, 0x4d, 0x42]));
     w.u16le(64);
@@ -183,7 +207,8 @@ export class SmbPacket {
     w.u64le(messageId);
     w.u32le(processId);
     w.u32le(treeId);
-    w.u64le(sessionId);
+    w.u32le(sessionIdLo);
+    w.u32le(sessionIdHi);
     w.bytes(new Uint8Array(16));
     w.bytes(body);
     return w.finish();
@@ -202,12 +227,14 @@ export class SmbPacket {
     const messageId = r.u64le();
     r.u32le();
     const treeId = r.u32le();
-    const sessionId = r.u64le();
+    const sessionIdLo = r.u32le();
+    const sessionIdHi = r.u32le();
     const header: SmbHeader = {
       command: command,
       status: status,
       messageId: messageId,
-      sessionId: sessionId,
+      sessionIdLo: sessionIdLo,
+      sessionIdHi: sessionIdHi,
       treeId: treeId,
       flags: flags
     };
@@ -224,20 +251,72 @@ export class SmbPacket {
     return raw.slice(SMB2_HEADER_LEN);
   }
 
-  static negotiateReq(clientGuid: Uint8Array): Uint8Array {
-    const dialects: number[] = [0x0202, 0x0210, 0x0300, 0x0302, 0x0311];
-    const w = new ByteWriter(36 + dialects.length * 2);
-    w.u16le(36);
-    w.u16le(dialects.length);
-    w.u16le(0x0001);
-    w.u16le(0);
-    w.u32le(0);
-    w.bytes(clientGuid);
-    w.u64le(0);
-    for (let i = 0; i < dialects.length; i++) {
-      w.u16le(dialects[i]);
+  static negotiateReq(clientGuid: Uint8Array, legacy: boolean): Uint8Array {
+    const dialects: number[] = legacy ? [0x0202, 0x0210] : [0x0202, 0x0210, 0x0300, 0x0302, 0x0311];
+    const salt = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) {
+      salt[i] = Math.floor(Math.random() * 256);
     }
-    return w.finish();
+    const ctxData = new Uint8Array(38);
+    SmbPacket.writeU16(ctxData, 0, 1);
+    SmbPacket.writeU16(ctxData, 2, 32);
+    SmbPacket.writeU16(ctxData, 4, 1);
+    ctxData.set(salt, 6);
+    const preauthCtx = new Uint8Array(8 + 38);
+    SmbPacket.writeU16(preauthCtx, 0, 1);
+    SmbPacket.writeU16(preauthCtx, 2, 38);
+    preauthCtx.set(ctxData, 8);
+    const pad8 = (b: Uint8Array): Uint8Array => {
+      const r = b.length % 8;
+      if (r === 0) {
+        return b;
+      }
+      const out = new Uint8Array(b.length + 8 - r);
+      out.set(b);
+      return out;
+    };
+    const ctxList = pad8(preauthCtx);
+    const dialectsBuf = new Uint8Array(dialects.length * 2);
+    for (let i = 0; i < dialects.length; i++) {
+      SmbPacket.writeU16(dialectsBuf, i * 2, dialects[i]);
+    }
+    const f = new Uint8Array(36);
+    SmbPacket.writeU16(f, 0, 36);
+    SmbPacket.writeU16(f, 2, dialects.length);
+    SmbPacket.writeU16(f, 4, 0x0002);
+    SmbPacket.writeU16(f, 6, 0);
+    SmbPacket.writeU32(f, 8, 0x45);
+    f.set(clientGuid, 12);
+    const ctxOffset = 64 + 36 + dialectsBuf.length;
+    const padLen = ctxOffset % 8 === 0 ? 0 : 8 - (ctxOffset % 8);
+    SmbPacket.writeU32(f, 28, ctxOffset + padLen);
+    SmbPacket.writeU16(f, 32, 1);
+    SmbPacket.writeU16(f, 34, 0);
+    const out = new Uint8Array(36 + dialectsBuf.length + padLen + ctxList.length);
+    out.set(f, 0);
+    out.set(dialectsBuf, 36);
+    out.set(ctxList, 36 + dialectsBuf.length + padLen);
+    return out;
+  }
+
+  private static writeU16(buf: Uint8Array, off: number, v: number): void {
+    buf[off] = v & 0xff;
+    buf[off + 1] = (v >> 8) & 0xff;
+  }
+
+  static readU16(buf: Uint8Array, off: number): number {
+    return buf[off] | (buf[off + 1] << 8);
+  }
+
+  static readU32(buf: Uint8Array, off: number): number {
+    return (buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)) >>> 0;
+  }
+
+  private static writeU32(buf: Uint8Array, off: number, v: number): void {
+    buf[off] = v & 0xff;
+    buf[off + 1] = (v >> 8) & 0xff;
+    buf[off + 2] = (v >> 16) & 0xff;
+    buf[off + 3] = (v >> 24) & 0xff;
   }
 
   static parseNegotiateResp(body: Uint8Array): NegotiateInfo {
@@ -263,23 +342,18 @@ export class SmbPacket {
   }
 
   static sessionSetupReq(blob: Uint8Array, preauthHash: Uint8Array | undefined, mic: Uint8Array | undefined): Uint8Array {
-    const fixedLen = 88;
+    const fixedLen = 24;
     const micLen = mic !== undefined ? 16 : 0;
+    const bufferOffset = 88;
     const w = new ByteWriter(fixedLen + blob.length + micLen);
     w.u16le(25);
     w.u8(0);
-    w.u8(0x01);
+    w.u8(0x02);
     w.u32le(0x00000001);
     w.u32le(0);
-    w.u16le(fixedLen);
+    w.u16le(bufferOffset);
     w.u16le(blob.length);
     w.u64le(0);
-    w.u32le(0);
-    if (preauthHash !== undefined) {
-      w.bytes(preauthHash);
-    } else {
-      w.bytes(new Uint8Array(64));
-    }
     w.bytes(blob);
     if (mic !== undefined) {
       w.bytes(mic);
@@ -311,6 +385,14 @@ export class SmbPacket {
   }
 
   static createReq(fileName: string, isDirectory: boolean): Uint8Array {
+    return SmbPacket.createReqWithAccess(fileName, isDirectory, 0x00120089);
+  }
+
+  static createPipeReq(pipeName: string): Uint8Array {
+    return SmbPacket.createReqWithAccess(pipeName, false, 0x00120183);
+  }
+
+  private static createReqWithAccess(fileName: string, isDirectory: boolean, accessMask: number): Uint8Array {
     const name = SmbCrypto.utf16leEncode(fileName);
     const w = new ByteWriter(56 + name.length);
     w.u16le(57);
@@ -319,7 +401,7 @@ export class SmbPacket {
     w.u32le(2);
     w.u64le(0);
     w.u64le(0);
-    w.u32le(0x00120089);
+    w.u32le(accessMask);
     w.u32le(0);
     w.u32le(0x7);
     w.u32le(0x1);
@@ -443,12 +525,149 @@ export class SmbPacket {
     return w.finish();
   }
 
+  static writeReq(fileId: Uint8Array, data: Uint8Array): Uint8Array {
+    const w = new ByteWriter(48 + data.length);
+    w.u16le(49);
+    w.u16le(112);
+    w.u32le(data.length);
+    w.u64le(0);
+    w.bytes(fileId);
+    w.u32le(0);
+    w.u32le(0);
+    w.u16le(0);
+    w.u16le(0);
+    w.u32le(0);
+    w.bytes(data);
+    return w.finish();
+  }
+
+  static parseWriteResp(body: Uint8Array): number {
+    const r = new ByteReader(body);
+    r.u16le();
+    r.u16le();
+    return r.u32le();
+  }
+
   static logoffReq(): Uint8Array {
     const w = new ByteWriter(4);
     w.u16le(4);
     w.u16le(0);
     return w.finish();
   }
+
+  static rpcBindPdu(callId: number): Uint8Array {
+    const srvsvcUuid = SmbPacket.uuidBytes([0x4b324fc8, 0x1670, 0x01d3, 0x1278], [0x5a, 0x47, 0xbf, 0x6e, 0xe1, 0x88]);
+    const ndrUuid = SmbPacket.uuidBytes([0x8a885d04, 0x1ceb, 0x11c9, 0x9fe8], [0x08, 0x00, 0x2b, 0x10, 0x48, 0x60]);
+    const w = new ByteWriter(72);
+    w.u8(5);
+    w.u8(0);
+    w.u8(0x0b);
+    w.u8(0x03);
+    w.u32le(0x00000010);
+    w.u16le(72);
+    w.u16le(0);
+    w.u32le(callId);
+    w.u16le(0x1000);
+    w.u16le(0x1000);
+    w.u32le(0);
+    w.u8(1);
+    w.u8(0);
+    w.u16le(0);
+    w.bytes(srvsvcUuid);
+    w.u16le(1);
+    w.u16le(0);
+    w.bytes(ndrUuid);
+    w.u16le(2);
+    w.u16le(0);
+    return w.finish();
+  }
+
+  static rpcNetShareEnumPdu(callId: number): Uint8Array {
+    const w = new ByteWriter(48);
+    w.u8(5);
+    w.u8(0);
+    w.u8(0x00);
+    w.u8(0x03);
+    w.u32le(0x00000010);
+    w.u16le(48);
+    w.u16le(0);
+    w.u32le(callId);
+    w.u32le(24);
+    w.u16le(0);
+    w.u16le(15);
+    w.u32le(0);
+    w.u32le(1);
+    w.u32le(0);
+    w.u32le(0xffffffff);
+    w.u32le(0);
+    w.u32le(0);
+    return w.finish();
+  }
+
+  static parseRpcResponseStub(frame: Uint8Array): Uint8Array {
+    return frame.slice(24);
+  }
+
+  static parseShareInfo1(stub: Uint8Array): RpcShareInfo[] {
+    const r = new ByteReader(stub);
+    r.u32le();
+    r.u32le();
+    const total = r.u32le();
+    const entries: RpcShareInfo[] = [];
+    if (total <= 0 || r.remaining() < 12) {
+      return entries;
+    }
+    r.u32le();
+    r.u32le();
+    r.u32le();
+    for (let i = 0; i < total; i++) {
+      const namePtr = r.u32le();
+      const type = r.u32le();
+      const remarkPtr = r.u32le();
+      const info: RpcShareInfo = {
+        name: SmbPacket.readUnicodeAt(stub, namePtr),
+        type: type,
+        remark: SmbPacket.readUnicodeAt(stub, remarkPtr)
+      };
+      entries.push(info);
+    }
+    return entries;
+  }
+
+  private static readUnicodeAt(stub: Uint8Array, ptr: number): string {
+    if (ptr <= 0 || ptr >= stub.length) {
+      return '';
+    }
+    let s = '';
+    let i = ptr;
+    while (i + 1 < stub.length && s.length < 400) {
+      const c = stub[i] | (stub[i + 1] << 8);
+      if (c === 0) {
+        break;
+      }
+      s += String.fromCharCode(c);
+      i += 2;
+    }
+    return s;
+  }
+
+  private static uuidBytes(parts: number[], tail: number[]): Uint8Array {
+    const w = new ByteWriter(16);
+    w.u32le(parts[0]);
+    w.u16le(parts[1]);
+    w.u16le(parts[2]);
+    w.u16be(parts[3]);
+    for (let i = 0; i < tail.length; i++) {
+      w.u8(tail[i]);
+    }
+    return w.finish();
+  }
+}
+
+export interface RpcShareInfo {
+  name: string;
+  type: number;
+  remark: string;
 }
 
 export interface NegotiateInfo {

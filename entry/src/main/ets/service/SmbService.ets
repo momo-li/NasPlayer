@@ -1,6 +1,7 @@
 import { SmbSession } from '../smb/SmbSession';
 import { SmbConfig } from '../model/SmbConfig';
 import { VideoEntry } from '../model/VideoEntry';
+import { ShareEntry } from '../model/ShareEntry';
 
 export class SmbService {
   private static instance: SmbService = new SmbService();
@@ -22,8 +23,25 @@ export class SmbService {
     return this.session.currentConfig;
   }
 
+  get currentHost(): string {
+    return this.session.currentHost;
+  }
+
   async connect(config: SmbConfig): Promise<void> {
     await this.session.connect(config);
+  }
+
+  async connectHost(host: string, username: string, password: string, domain: string,
+    port: number): Promise<void> {
+    await this.session.connectHost(host, username, password, domain, port);
+  }
+
+  async enumerateShares(): Promise<ShareEntry[]> {
+    return this.session.enumerateShares();
+  }
+
+  async enterShare(shareName: string): Promise<void> {
+    await this.session.enterShare(shareName);
   }
 
   async readdir(relPath: string): Promise<VideoEntry[]> {

@@ -187,7 +187,7 @@ export default struct BrowserPage {
     }
     .width('100%')
     .padding({ left: 14, right: 14, top: 10, bottom: 10 })
-    .backgroundColor(Color.White)
+    .backgroundColor($r('app.color.card_bg'))
     .borderRadius(10)
   }
 

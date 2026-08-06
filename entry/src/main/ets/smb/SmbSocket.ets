@@ -29,7 +29,12 @@ export class SmbSocket {
     this.tcp = tcp;
     const addr: socket.NetAddress = { address: host, port: port, family: 1 };
     const opts: socket.TCPConnectOptions = { address: addr, timeout: 10000 };
-    await tcp.connect(opts);
+    try {
+      await tcp.connect(opts);
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'tcp connect failed: %{public}s', JSON.stringify(e));
+      throw new Error('connect failed');
+    }
     tcp.on('message', (info: socket.SocketMessageInfo) => {
       this.handleData(new Uint8Array(info.message));
     });

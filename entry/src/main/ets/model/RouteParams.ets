@@ -8,3 +8,7 @@ export interface PlayerParams {
   files: VideoEntry[];
   index: number;
 }
+
+export interface SharesParams {
+  host: string;
+}

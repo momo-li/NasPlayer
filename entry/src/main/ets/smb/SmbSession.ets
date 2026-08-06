@@ -2,6 +2,11 @@ import { SmbClient } from './SmbClient';
 import { QueryEntry } from './SmbPacket';
 import { VideoEntry } from '../model/VideoEntry';
 import { SmbConfig } from '../model/SmbConfig';
+import { ShareEntry } from '../model/ShareEntry';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+
+const DOMAIN = 0x0000;
+const TAG = 'SmbSession';
 
 export class SmbSession {
   private client: SmbClient | undefined = undefined;
@@ -13,6 +18,13 @@ export class SmbSession {
 
   get currentConfig(): SmbConfig | undefined {
     return this.config;
+  }
+
+  get currentHost(): string {
+    if (this.config !== undefined) {
+      return this.config.host;
+    }
+    return '';
   }
 
   get dialectText(): string {
@@ -37,11 +49,73 @@ export class SmbSession {
 
   async connect(config: SmbConfig): Promise<void> {
     await this.disconnect();
+    try {
+      await this.connectWithLegacy(config.host, config.share, config.username, config.password,
+        config.domain, config.port, false);
+    } catch (e) {
+      if (SmbSession.shouldRetryLegacy(e)) {
+        hilog.warn(DOMAIN, TAG, 'connect failed, retry with SMB 2.1 dialect');
+        await this.connectWithLegacy(config.host, config.share, config.username, config.password,
+          config.domain, config.port, true);
+      } else {
+        throw e as Error;
+      }
+    }
+  }
+
+  async connectHost(host: string, username: string, password: string, domain: string,
+    port: number): Promise<void> {
+    await this.disconnect();
+    try {
+      await this.connectWithLegacy(host, 'IPC$', username, password, domain, port, false);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const stack = e instanceof Error && e.stack !== undefined ? e.stack : '';
+      hilog.error(DOMAIN, TAG, 'connectHost first attempt failed: %{public}s stack=%{public}s', msg, stack);
+      if (SmbSession.shouldRetryLegacy(e)) {
+        hilog.warn(DOMAIN, TAG, 'connectHost failed, retry with SMB 2.1 dialect');
+        await this.connectWithLegacy(host, 'IPC$', username, password, domain, port, true);
+      } else {
+        throw e as Error;
+      }
+    }
+  }
+
+  private static shouldRetryLegacy(e: Error): boolean {
+    const msg = e.message;
+    return msg.indexOf('断开') >= 0 || msg.indexOf('closed') >= 0 || msg.indexOf('超时') >= 0 ||
+      msg.indexOf('socket') >= 0 || msg.indexOf('服务器拒绝请求') >= 0;
+  }
+
+  private async connectWithLegacy(host: string, share: string, username: string, password: string,
+    domain: string, port: number, legacy: boolean): Promise<void> {
     const client = new SmbClient();
-    await client.connect(config.host, config.share, config.username, config.password,
-      config.domain, config.port);
+    await client.connect(host, share, username, password, domain, port, legacy);
     this.client = client;
-    this.config = config;
+    const cfg: SmbConfig = {
+      host: host,
+      port: port,
+      share: share,
+      username: username,
+      password: password,
+      domain: domain
+    };
+    this.config = cfg;
+  }
+
+  async enumerateShares(): Promise<ShareEntry[]> {
+    if (this.client === undefined) {
+      throw new Error('未连接');
+    }
+    return this.client.enumerateShares();
+  }
+
+  async enterShare(shareName: string): Promise<void> {
+    if (this.client === undefined || this.config === undefined) {
+      throw new Error('未连接');
+    }
+    await this.client.treeConnectTo(shareName);
+    this.config.share = shareName;
   }
 
   async readdir(relPath: string): Promise<VideoEntry[]> {
@@ -90,3 +164,4 @@ export class SmbSession {
     }
   }
 }
+

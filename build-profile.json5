@@ -7,11 +7,11 @@
         "material": {
           "certpath": "C:\\Users\\liyah\\.ohos\\config\\default_NasPlayer_3CudkD8NtWJVzm0Qtfw36AtN8z-7CyUMG6ObQFvPjmI=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001A337DA40DE9BF06D1BA4E44E5BDF510E118CE3DFB8EE2520D640E3830AB039BAD93251B0D323A",
+          "keyPassword": "0000001B599D0823D583426F84A2A3BA97CEF7FAD19BC0B21D961D3AE0018D483CE7EDC46CB4F4A974C273",
           "profile": "C:\\Users\\liyah\\.ohos\\config\\default_NasPlayer_3CudkD8NtWJVzm0Qtfw36AtN8z-7CyUMG6ObQFvPjmI=.p7b",
           "signAlg": "SHA256withECDSA",
           "storeFile": "C:\\Users\\liyah\\.ohos\\config\\default_NasPlayer_3CudkD8NtWJVzm0Qtfw36AtN8z-7CyUMG6ObQFvPjmI=.p12",
-          "storePassword": "0000001A38BE16EF0C8143B39BEE601005CC63D75EDCDC322BAD815858A2470D1CDADCDB85FA6C052285"
+          "storePassword": "0000001B7F3B3E8A2A41EFC96EA5ECAAE911CF401AA865D4D51FAD23E3A1AE8301207B71E9E6D7A069BBF8"
         }
       }
     ],

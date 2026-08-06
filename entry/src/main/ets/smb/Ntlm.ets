@@ -30,7 +30,7 @@ export class Ntlm {
   }
 
   static async createType3(username: string, workstation: string, domain: string,
-    serverChallenge: Uint8Array, password: string): Promise<NtlmType3Result> {
+    serverChallenge: Uint8Array, password: string, targetInfo: Uint8Array): Promise<NtlmType3Result> {
     const ntHash = SmbCrypto.md4(SmbCrypto.utf16leEncode(password));
     const userDomain = SmbCrypto.concat([SmbCrypto.utf16leEncode(username.toUpperCase()), SmbCrypto.utf16leEncode(domain)]);
     const ntlmv2Hash = await SmbCrypto.hmacMd5(ntHash, userDomain);
@@ -38,7 +38,7 @@ export class Ntlm {
 
     const timestamp = Ntlm.fileTimeNow();
     const clientChallenge = await SmbCrypto.randomBytes(8);
-    const blob = Ntlm.buildBlob(timestamp, clientChallenge);
+    const blob = Ntlm.buildBlob(timestamp, clientChallenge, targetInfo);
 
     const ntProofStr = await SmbCrypto.hmacMd5(ntlmv2Hash, SmbCrypto.concat([serverChallenge, blob]));
     const ntChallengeResponse = SmbCrypto.concat([ntProofStr, blob]);
@@ -52,7 +52,7 @@ export class Ntlm {
     const userBytes = SmbCrypto.utf16leEncode(username);
     const workstationBytes = SmbCrypto.utf16leEncode(workstation);
 
-    const fixedLen = 52;
+    const fixedLen = 64;
     let offset = fixedLen;
     const lmOff = offset;
     offset += lmChallengeResponse.length;
@@ -94,8 +94,9 @@ export class Ntlm {
     w.u32le(off);
   }
 
-  private static buildBlob(timestamp: number, clientChallenge: Uint8Array): Uint8Array {
-    const w = new ByteWriter(36);
+  private static buildBlob(timestamp: number, clientChallenge: Uint8Array, targetInfo: Uint8Array): Uint8Array {
+    const ti = targetInfo !== undefined ? targetInfo : new Uint8Array(0);
+    const w = new ByteWriter(28 + ti.length + 4);
     w.u8(0x01);
     w.u8(0x01);
     w.u16le(0x0000);
@@ -103,6 +104,7 @@ export class Ntlm {
     w.u64le(timestamp);
     w.bytes(clientChallenge);
     w.u32le(0x00000000);
+    w.bytes(ti);
     w.u16le(0x0000);
     w.u16le(0x0000);
     return w.finish();

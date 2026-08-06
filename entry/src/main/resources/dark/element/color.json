@@ -2,7 +2,55 @@
   "color": [
     {
       "name": "start_window_background",
+      "value": "#0F0F14"
+    },
+    {
+      "name": "theme_primary",
+      "value": "#64B5F6"
+    },
+    {
+      "name": "theme_bg",
+      "value": "#0F0F14"
+    },
+    {
+      "name": "card_bg",
+      "value": "#1E1E26"
+    },
+    {
+      "name": "text_main",
+      "value": "#E8E8EC"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#8F8F98"
+    },
+    {
+      "name": "text_error",
+      "value": "#FF6B6B"
+    },
+    {
+      "name": "button_cancel_bg",
+      "value": "#2E2E36"
+    },
+    {
+      "name": "player_bg",
       "value": "#000000"
+    },
+    {
+      "name": "player_overlay",
+      "value": "#66000000"
+    },
+    {
+      "name": "poster_bg",
+      "value": "#2B2F3A"
+    },
+    {
+      "name": "divider",
+      "value": "#2A2A32"
+    },
+    {
+      "name": "white",
+      "value": "#FFFFFF"
     }
   ]
 }
