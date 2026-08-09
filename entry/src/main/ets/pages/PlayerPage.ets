@@ -1,6 +1,7 @@
 import { media } from '@kit.MediaKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { window, display } from '@kit.ArkUI';
+import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { VideoEntry } from '../model/VideoEntry';
 import { PlayerParams } from '../model/RouteParams';
@@ -18,7 +19,7 @@ export default struct PlayerPage {
   private dragging: boolean = false;
   private startupDone: boolean = false;
   private autoRetrying: boolean = false;
-  private isLandscape: boolean = false;
+  @State isLandscape: boolean = false;
   private resumePosition: number = 0;
 
   @State videoFiles: VideoEntry[] = [];
@@ -87,10 +88,12 @@ export default struct PlayerPage {
   }
 
   aboutToDisappear(): void {
+    this.exitLandscape();
     this.cleanup();
   }
 
   onPageHide(): void {
+    this.exitLandscape();
     this.pauseIfPlaying();
   }
 
@@ -99,12 +102,33 @@ export default struct PlayerPage {
   }
 
   private async enterLandscape(): Promise<void> {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const win = ctx.windowStage.getMainWindowSync();
+      win.setPreferredOrientation(window.Orientation.LANDSCAPE);
+      this.isLandscape = true;
+    } catch (e) {
+      console.error('enter landscape failed: ' + JSON.stringify(e));
+    }
   }
 
   private async exitLandscape(): Promise<void> {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const win = ctx.windowStage.getMainWindowSync();
+      win.setPreferredOrientation(window.Orientation.PORTRAIT);
+      this.isLandscape = false;
+    } catch (e) {
+      console.error('exit landscape failed: ' + JSON.stringify(e));
+    }
   }
 
   private async toggleLandscape(): Promise<void> {
+    if (this.isLandscape) {
+      await this.exitLandscape();
+    } else {
+      await this.enterLandscape();
+    }
     this.showControlsTemporarily();
   }
 
@@ -465,6 +489,15 @@ export default struct PlayerPage {
                 .borderRadius(14)
                 .onClick(() => {
                   this.cycleScale();
+                })
+              Text(this.isLandscape ? '竖屏' : '横屏')
+                .fontSize(13)
+                .fontColor(Color.White)
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor('rgba(255,255,255,0.18)')
+                .borderRadius(14)
+                .onClick(() => {
+                  this.toggleLandscape();
                 })
             }
             .width('100%')
