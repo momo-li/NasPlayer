@@ -336,6 +336,7 @@ export default struct PlayerPage {
       }
       await player.play();
       hilog.info(0x0000, 'NasPlayer', 'playEntry: play() ok, state=%{public}s', player.state);
+      this.playing = true;
       this.errorMsg = '';
       this.loading = false;
     } catch (e) {
@@ -401,20 +402,34 @@ export default struct PlayerPage {
     return '视频加载失败：本地流服务异常，请重试';
   }
 
+  private playIcon(): string {
+    return this.playing ? '暂停' : '播放';
+  }
+
   private async togglePlay(): Promise<void> {
     this.showControlsTemporarily();
     const p = this.avPlayer;
+    hilog.info(0x0000, 'NasPlayer', 'togglePlay: player=%{public}s playing=%{public}s state=%{public}s',
+      String(p !== undefined), String(this.playing), p !== undefined ? p.state : 'none');
     if (p === undefined) {
       return;
     }
     try {
-      if (this.playing) {
+      const st = p.state;
+      if (st === 'playing') {
         await p.pause();
-      } else {
+        this.playing = false;
+        hilog.info(0x0000, 'NasPlayer', 'togglePlay: pause() ok');
+      } else if (st === 'paused' || st === 'prepared' || st === 'completed') {
         await p.play();
+        this.playing = true;
+        hilog.info(0x0000, 'NasPlayer', 'togglePlay: play() ok');
+      } else {
+        hilog.info(0x0000, 'NasPlayer', 'togglePlay: state=%{public}s not operable', st);
       }
     } catch (e) {
       console.error('toggle play failed: ' + JSON.stringify(e));
+      hilog.error(0x0000, 'NasPlayer', 'togglePlay failed: %{public}s', JSON.stringify(e));
     }
   }
 
@@ -613,47 +628,11 @@ export default struct PlayerPage {
             Row({ space: 10 }) {
               Text(this.index >= 0 && this.videoFiles.length > 0 && this.index < this.videoFiles.length ?
                 this.videoFiles[this.index].name : '')
-                .fontSize(15)
+                .fontSize(13)
                 .fontColor(Color.White)
-                .maxLines(1)
+                .maxLines(2)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
                 .layoutWeight(1)
-              Text(this.speedLabels[this.speedIdx])
-                .fontSize(13)
-                .fontColor(Color.White)
-                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-                .backgroundColor('rgba(255,255,255,0.18)')
-                .borderRadius(14)
-                .onClick(() => {
-                  this.cycleSpeed();
-                })
-              Text(this.scaleLabels[this.scaleIdx])
-                .fontSize(13)
-                .fontColor(Color.White)
-                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-                .backgroundColor('rgba(255,255,255,0.18)')
-                .borderRadius(14)
-                .onClick(() => {
-                  this.cycleScale();
-                })
-              Text('亮度')
-                .fontSize(13)
-                .fontColor(Color.White)
-                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-                .backgroundColor(this.brightnessPanel ? 'rgba(30,136,229,0.6)' : 'rgba(255,255,255,0.18)')
-                .borderRadius(14)
-                .onClick(() => {
-                  this.toggleBrightnessPanel();
-                })
-              Text(this.isLandscape ? '竖屏' : '横屏')
-                .fontSize(13)
-                .fontColor(Color.White)
-                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-                .backgroundColor('rgba(255,255,255,0.18)')
-                .borderRadius(14)
-                .onClick(() => {
-                  this.toggleLandscape();
-                })
             }
             .width('100%')
             .padding({ left: 16, right: 16, top: 14 })
@@ -680,7 +659,53 @@ export default struct PlayerPage {
                 .fontColor(Color.White)
             }
             .width('100%')
-            .padding({ left: 16, right: 16, bottom: 18 })
+            .padding({ left: 16, right: 16 })
+
+            Row({ space: 10 }) {
+              Text(this.playIcon())
+                .fontSize(13)
+                .fontColor(Color.White)
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor('rgba(255,255,255,0.18)')
+                .borderRadius(14)
+                .onClick(() => {this.togglePlay();
+                })
+              Blank()
+              Text(this.speedLabels[this.speedIdx])
+                .fontSize(13)
+                .fontColor(Color.White)
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor('rgba(255,255,255,0.18)')
+                .borderRadius(14)
+                .onClick(() => {this.cycleSpeed();
+                })
+              Text(this.scaleLabels[this.scaleIdx])
+                .fontSize(13)
+                .fontColor(Color.White)
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor('rgba(255,255,255,0.18)')
+                .borderRadius(14)
+                .onClick(() => {this.cycleScale();
+                })
+              Text('亮度')
+                .fontSize(13)
+                .fontColor(Color.White)
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor(this.brightnessPanel ? 'rgba(30,136,229,0.6)' : 'rgba(255,255,255,0.18)')
+                .borderRadius(14)
+                .onClick(() => {this.toggleBrightnessPanel();
+                })
+              Text(this.isLandscape ? '竖屏' : '横屏')
+                .fontSize(13)
+                .fontColor(Color.White)
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor('rgba(255,255,255,0.18)')
+                .borderRadius(14)
+                .onClick(() => {this.toggleLandscape();
+                })
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 10, bottom: 18 })
           }
           .width('100%')
           .height('100%')
