@@ -3,6 +3,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { window, display } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { settings } from '@kit.BasicServicesKit';
 import { VideoEntry } from '../model/VideoEntry';
 import { PlayerParams } from '../model/RouteParams';
 import { StreamServer } from '../service/StreamServer';
@@ -114,10 +115,10 @@ export default struct PlayerPage {
   private async readBrightness(): Promise<void> {
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const win = ctx.windowStage.getMainWindowSync();
-      const props = win.getWindowProperties();
-      if (props.brightness > 0) {
-        this.screenBrightness = props.brightness;
+      const raw = settings.getValueSync(ctx, settings.display.SCREEN_BRIGHTNESS_STATUS, '128');
+      const v = Number(raw);
+      if (v > 0) {
+        this.screenBrightness = v / 255;
       }
     } catch (e) {
       console.error('get brightness failed: ' + JSON.stringify(e));
@@ -184,7 +185,7 @@ export default struct PlayerPage {
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const win = ctx.windowStage.getMainWindowSync();
-      win.setWindowBrightness(1.0);
+      win.setWindowBrightness(-1);
     } catch (e) {
       console.error('restore brightness failed: ' + JSON.stringify(e));
     }
