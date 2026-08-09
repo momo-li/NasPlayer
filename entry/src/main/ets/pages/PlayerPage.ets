@@ -196,7 +196,7 @@ export default struct PlayerPage {
     });
   }
 
-  private async playEntry(entry: VideoEntry, retried: boolean = false): Promise<void> {
+  private async playEntry(entry: VideoEntry, retryCount: number = 0): Promise<void> {
     this.loading = true;
     this.errorMsg = '';
     this.completed = false;
@@ -246,8 +246,8 @@ export default struct PlayerPage {
       this.loading = false;
     } catch (e) {
       console.error('play failed: ' + JSON.stringify(e));
-      if (!retried) {
-        hilog.info(0x0000, 'NasPlayer', 'play failed, auto retry once');
+      if (retryCount < 3) {
+        hilog.info(0x0000, 'NasPlayer', 'play failed, auto retry %{public}d', retryCount + 1);
         this.autoRetrying = true;
         try {
           const old = this.avPlayer;
@@ -261,9 +261,9 @@ export default struct PlayerPage {
         await new Promise<void>((r) => {
           setTimeout(() => {
             r();
-          }, 500);
+          }, 1000);
         });
-        await this.playEntry(entry, true);
+        await this.playEntry(entry, retryCount + 1);
         return;
       }
       this.autoRetrying = false;
@@ -451,18 +451,18 @@ export default struct PlayerPage {
               Text(this.speedLabels[this.speedIdx])
                 .fontSize(13)
                 .fontColor(Color.White)
-                .padding({ left: 10, right: 10, top: 4, bottom: 4 })
-                .backgroundColor($r('app.color.player_overlay'))
-                .borderRadius(12)
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor('rgba(255,255,255,0.18)')
+                .borderRadius(14)
                 .onClick(() => {
                   this.cycleSpeed();
                 })
               Text(this.scaleLabels[this.scaleIdx])
                 .fontSize(13)
                 .fontColor(Color.White)
-                .padding({ left: 10, right: 10, top: 4, bottom: 4 })
-                .backgroundColor($r('app.color.player_overlay'))
-                .borderRadius(12)
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor('rgba(255,255,255,0.18)')
+                .borderRadius(14)
                 .onClick(() => {
                   this.cycleScale();
                 })
@@ -471,29 +471,6 @@ export default struct PlayerPage {
             .padding({ left: 16, right: 16, top: 14 })
 
             Blank()
-
-            Row({ space: 40 }) {
-              Text('⏮')
-                .fontSize(26)
-                .fontColor(Color.White)
-                .onClick(() => {
-                  this.switchTo(-1);
-                })
-              Text(this.playing ? '⏸' : '▶')
-                .fontSize(34)
-                .fontColor(Color.White)
-                .onClick(() => {
-                  this.togglePlay();
-                })
-              Text('⏭')
-                .fontSize(26)
-                .fontColor(Color.White)
-                .onClick(() => {
-                  this.switchTo(1);
-                })
-            }
-            .width('100%')
-            .justifyContent(FlexAlign.Center)
 
             Row({ space: 8 }) {
               Text(MediaUtil.formatDuration(this.currentTime))
