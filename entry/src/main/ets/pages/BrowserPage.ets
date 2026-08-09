@@ -127,12 +127,12 @@ export default struct BrowserPage {
     this.getUIContext().getPromptAction().showToast({ message: msg });
   }
 
-  async load(path: string): Promise<void> {
+  async load(path: string, force: boolean = false): Promise<void> {
     this.loading = true;
     this.errorText = '';
     this.emptyText = '';
     try {
-      const list = await SmbService.getInstance().readdir(path);
+      const list = await SmbService.getInstance().readdir(path, force);
       this.currentPath = path;
       this.source.setData(list);
       if (list.length === 0) {
@@ -244,7 +244,7 @@ export default struct BrowserPage {
           }
           .onRefreshing(() => {
             this.refreshing = true;
-            this.load(this.currentPath).finally(() => {
+            this.load(this.currentPath, true).finally(() => {
               this.refreshing = false;
             });
           })

@@ -30,6 +30,13 @@ interface PendingEntry {
   onError: (err: Error) => void;
 }
 
+interface DirCacheEntry {
+  entries: QueryEntry[];
+  ts: number;
+}
+
+const DIR_CACHE_TTL_MS = 5000;
+
 export class SmbClient {
   private socket: SmbSocket = new SmbSocket();
   private host: string = '';
@@ -56,6 +63,7 @@ export class SmbClient {
 
   private pending: Map<number, PendingEntry> = new Map<number, PendingEntry>();
   private connected: boolean = false;
+  private dirCache: Map<string, DirCacheEntry> = new Map<string, DirCacheEntry>();
 
   get isConnected(): boolean {
     return this.connected;
@@ -462,7 +470,13 @@ export class SmbClient {
     }
   }
 
-  async readdir(relPath: string): Promise<QueryEntry[]> {
+  async readdir(relPath: string, force: boolean = false): Promise<QueryEntry[]> {
+    if (!force) {
+      const cached = this.dirCache.get(relPath);
+      if (cached !== undefined && Date.now() - cached.ts < DIR_CACHE_TTL_MS) {
+        return cached.entries;
+      }
+    }
     const dir = await this.create(relPath, true);
     const entries: QueryEntry[] = [];
     try {
@@ -491,7 +505,12 @@ export class SmbClient {
       await this.closeFile(dir.fileId);
     }
     await this.probeEntries(relPath, entries);
+    this.dirCache.set(relPath, { entries: entries, ts: Date.now() });
     return entries;
+  }
+
+  clearDirCache(): void {
+    this.dirCache.clear();
   }
 
   private async probeEntries(relPath: string, entries: QueryEntry[]): Promise<void> {
@@ -502,24 +521,49 @@ export class SmbClient {
         probes.push(e);
       }
     }
-    for (let i = 0; i < probes.length; i += 4) {
-      const group = probes.slice(i, i + 4);
+    const CONCURRENCY = 8;
+    for (let i = 0; i < probes.length; i += CONCURRENCY) {
+      const group = probes.slice(i, i + CONCURRENCY);
       await Promise.all(group.map(async (e: QueryEntry) => {
         const full = relPath.length === 0 ? e.name : relPath + '\\' + e.name;
-        try {
-          const d = await this.create(full, true);
-          e.isDirectory = true;
-          e.size = d.endOfFile;
-          e.lastWriteTime = d.lastWriteTime;
-          await this.closeFile(d.fileId);
-        } catch (err) {
+        const dotIdx = e.name.indexOf('.');
+        if (dotIdx < 0) {
           try {
-            const f = await this.create(full, false);
-            e.isDirectory = false;
-            e.size = f.endOfFile;
-            e.lastWriteTime = f.lastWriteTime;
-            await this.closeFile(f.fileId);
-          } catch (err2) {
+            const d = await this.create(full, true);
+            e.isDirectory = true;
+            e.size = d.endOfFile;
+            e.lastWriteTime = d.lastWriteTime;
+            await this.closeFile(d.fileId);
+            return;
+          } catch (err) {
+            try {
+              const f = await this.create(full, false);
+              e.isDirectory = false;
+              e.size = f.endOfFile;
+              e.lastWriteTime = f.lastWriteTime;
+              await this.closeFile(f.fileId);
+            } catch (err2) {
+              e.isDirectory = false;
+              e.size = 0;
+              e.lastWriteTime = 0;
+            }
+            return;
+          }
+        }
+        try {
+          const f = await this.create(full, false);
+          e.isDirectory = false;
+          e.size = f.endOfFile;
+          e.lastWriteTime = f.lastWriteTime;
+          await this.closeFile(f.fileId);
+        } catch (err2) {
+          try {
+            const d = await this.create(full, true);
+            e.isDirectory = true;
+            e.size = d.endOfFile;
+            e.lastWriteTime = d.lastWriteTime;
+            await this.closeFile(d.fileId);
+          } catch (err3) {
             e.isDirectory = false;
             e.size = 0;
             e.lastWriteTime = 0;

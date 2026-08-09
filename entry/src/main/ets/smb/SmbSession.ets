@@ -90,24 +90,24 @@ export class SmbSession {
     this.config.share = shareName;
   }
 
-  async readdir(relPath: string): Promise<VideoEntry[]> {
+  async readdir(relPath: string, force: boolean = false): Promise<VideoEntry[]> {
     try {
-      return await this.readdirOnce(relPath);
+      return await this.readdirOnce(relPath, force);
     } catch (e) {
       if (SmbSession.isNetworkError(e) && this.config !== undefined) {
         hilog.warn(DOMAIN, TAG, 'readdir network error, reconnect and retry');
         await this.reconnect();
-        return await this.readdirOnce(relPath);
+        return await this.readdirOnce(relPath, force);
       }
       throw e as Error;
     }
   }
 
-  private async readdirOnce(relPath: string): Promise<VideoEntry[]> {
+  private async readdirOnce(relPath: string, force: boolean): Promise<VideoEntry[]> {
     if (this.client === undefined) {
       throw new Error('未连接');
     }
-    const raw = await this.client.readdir(relPath);
+    const raw = await this.client.readdir(relPath, force);
     const out: VideoEntry[] = [];
     for (let i = 0; i < raw.length; i++) {
       const e: QueryEntry = raw[i];

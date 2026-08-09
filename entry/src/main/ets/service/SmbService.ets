@@ -44,8 +44,8 @@ export class SmbService {
     await this.session.enterShare(shareName);
   }
 
-  async readdir(relPath: string): Promise<VideoEntry[]> {
-    return this.session.readdir(relPath);
+  async readdir(relPath: string, force: boolean = false): Promise<VideoEntry[]> {
+    return this.session.readdir(relPath, force);
   }
 
   async getSize(relPath: string): Promise<number> {
