@@ -35,6 +35,8 @@ export default struct PlayerPage {
   @State scaleIdx: number = 0;
   @State xScale: number = 1;
   @State yScale: number = 1;
+  @State screenBrightness: number = 0.8;
+  @State brightnessPanel: boolean = false;
 
   private videoRatio: number = 0;
   private screenWidth: number = 1280;
@@ -109,6 +111,38 @@ export default struct PlayerPage {
     this.getUIContext().getPromptAction().showToast({ message: msg });
   }
 
+  private async readBrightness(): Promise<void> {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const win = ctx.windowStage.getMainWindowSync();
+      const props = win.getWindowProperties();
+      if (props.brightness > 0) {
+        this.screenBrightness = props.brightness;
+      }
+    } catch (e) {
+      console.error('get brightness failed: ' + JSON.stringify(e));
+    }
+  }
+
+  private async setBrightness(v: number): Promise<void> {
+    this.screenBrightness = v;
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const win = ctx.windowStage.getMainWindowSync();
+      win.setWindowBrightness(v);
+    } catch (e) {
+      console.error('set brightness failed: ' + JSON.stringify(e));
+    }
+  }
+
+  private toggleBrightnessPanel(): void {
+    this.showControlsTemporarily();
+    this.brightnessPanel = !this.brightnessPanel;
+    if (this.brightnessPanel) {
+      this.readBrightness();
+    }
+  }
+
   private async enterLandscape(): Promise<void> {
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -146,6 +180,13 @@ export default struct PlayerPage {
     if (this.hideTimer >= 0) {
       clearTimeout(this.hideTimer);
       this.hideTimer = -1;
+    }
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const win = ctx.windowStage.getMainWindowSync();
+      win.setWindowBrightness(1.0);
+    } catch (e) {
+      console.error('restore brightness failed: ' + JSON.stringify(e));
     }
     const p = this.avPlayer;
     this.avPlayer = undefined;
@@ -525,6 +566,47 @@ export default struct PlayerPage {
           }
         }
 
+        if (this.brightnessPanel) {
+          Column({ space: 14 }) {
+            Text('亮度 ' + Math.round(this.screenBrightness * 100) + '%')
+              .fontSize(15)
+              .fontColor(Color.White)
+            Row({ space: 10 }) {
+              Text('☾')
+                .fontSize(16)
+                .fontColor(Color.White)
+              Slider({
+                value: this.screenBrightness,
+                min: 0,
+                max: 1,
+                step: 0.01,
+                style: SliderStyle.OutSet
+              })
+                .layoutWeight(1)
+                .onChange((v: number) => {
+                  this.setBrightness(v);
+                })
+              Text('☀')
+                .fontSize(16)
+                .fontColor(Color.White)
+            }
+            .width(260)
+            Button('完成')
+              .fontSize(13)
+              .height(32)
+              .backgroundColor($r('app.color.theme_primary'))
+              .onClick(() => {
+                this.brightnessPanel = false;
+              })
+          }
+          .padding({ left: 20, right: 20, top: 16, bottom: 16 })
+          .backgroundColor('rgba(0,0,0,0.72)')
+          .borderRadius(14)
+          .onClick(() => {
+            this.brightnessPanel = false;
+          })
+        }
+
         if (this.controlsVisible && this.errorMsg.length === 0) {
           Column() {
             Row({ space: 10 }) {
@@ -552,6 +634,15 @@ export default struct PlayerPage {
                 .borderRadius(14)
                 .onClick(() => {
                   this.cycleScale();
+                })
+              Text('亮度')
+                .fontSize(13)
+                .fontColor(Color.White)
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor(this.brightnessPanel ? 'rgba(30,136,229,0.6)' : 'rgba(255,255,255,0.18)')
+                .borderRadius(14)
+                .onClick(() => {
+                  this.toggleBrightnessPanel();
                 })
               Text(this.isLandscape ? '竖屏' : '横屏')
                 .fontSize(13)
