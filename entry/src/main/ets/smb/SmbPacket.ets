@@ -486,7 +486,7 @@ export class SmbPacket {
     r.u32le();
     r.u64le();
     r.u64le();
-    r.u64le();
+    const lastWriteTime = r.u64le();
     r.u64le();
     r.u64le();
     const endOfFile = r.u64le();
@@ -495,7 +495,8 @@ export class SmbPacket {
     const fileId = r.bytes(16);
     const info: CreateInfo = {
       fileId: fileId,
-      endOfFile: endOfFile
+      endOfFile: endOfFile,
+      lastWriteTime: lastWriteTime
     };
     return info;
   }
@@ -534,7 +535,8 @@ export class SmbPacket {
       const entry: QueryEntry = {
         name: name,
         isDirectory: false,
-        size: 0
+        size: 0,
+        lastWriteTime: 0
       };
       entries.push(entry);
       if (next === 0 || er.remaining() < 4) {
@@ -770,10 +772,12 @@ export interface NegotiateInfo {
 export interface CreateInfo {
   fileId: Uint8Array;
   endOfFile: number;
+  lastWriteTime: number;
 }
 
 export interface QueryEntry {
   name: string;
   isDirectory: boolean;
   size: number;
+  lastWriteTime: number;
 }

@@ -12,7 +12,7 @@ export default struct ShareListPage {
   @State shares: ShareEntry[] = [];
   @State loading: boolean = false;
   @State errorText: string = '';
-  @State fromCache: boolean = false;
+  @State refreshing: boolean = false;
 
   aboutToAppear(): void {
     this.load();
@@ -46,7 +46,6 @@ export default struct ShareListPage {
         const cached = await ConfigStore.loadShares(ctx, this.params.host);
         if (cached.length > 0) {
           this.shares = this.filterShares(cached);
-          this.fromCache = true;
           this.loading = false;
           return;
         }
@@ -54,7 +53,6 @@ export default struct ShareListPage {
       const raw = await SmbService.getInstance().enumerateShares();
       const list = this.filterShares(raw);
       this.shares = list;
-      this.fromCache = false;
       if (list.length > 0) {
         await ConfigStore.saveShares(ctx, this.params.host, list);
       }
@@ -167,23 +165,7 @@ export default struct ShareListPage {
           .height('100%')
           .justifyContent(FlexAlign.Center)
         } else {
-          Column() {
-            Row() {
-              Text(this.fromCache ? '上次扫描的共享（点击刷新获取最新）' : '共享列表')
-                .fontSize(12)
-                .fontColor($r('app.color.text_secondary'))
-                .layoutWeight(1)
-              Button('刷新')
-                .fontSize(12)
-                .height(28)
-                .padding({ left: 10, right: 10 })
-                .backgroundColor($r('app.color.theme_primary'))
-                .onClick(() => {
-                  this.load(true);
-                })
-            }
-            .width('100%')
-            .padding({ left: 14, right: 14, bottom: 6 })
+          Refresh({ refreshing: $$this.refreshing }) {
             List({ space: 8 }) {
               ForEach(this.shares, (entry: ShareEntry) => {
                 ListItem() {
@@ -199,8 +181,14 @@ export default struct ShareListPage {
             .padding({ left: 14, right: 14, bottom: 14 })
             .scrollBar(BarState.Off)
           }
+          .onRefreshing(() => {
+            this.refreshing = true;
+            this.load(true).finally(() => {
+              this.refreshing = false;
+            });
+          })
+          .layoutWeight(1)
           .width('100%')
-          .height('100%')
         }
       }
       .width('100%')

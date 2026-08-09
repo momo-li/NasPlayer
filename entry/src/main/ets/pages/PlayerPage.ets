@@ -246,7 +246,7 @@ export default struct PlayerPage {
     this.currentTime = 0;
     this.duration = 0;
     try {
-      await StreamServer.getInstance().start();
+      await StreamServer.getInstance().restart();
       hilog.info(0x0000, 'NasPlayer', 'playEntry: stream server started, port=%{public}d',
         StreamServer.getInstance().getPort());
       let player = this.avPlayer;

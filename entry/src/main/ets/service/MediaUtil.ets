@@ -69,4 +69,22 @@ export class MediaUtil {
     }
     return mm + ':' + ss;
   }
+
+  static formatTime(ms: number): string {
+    if (ms <= 0) {
+      return '--';
+    }
+    const d = new Date(ms);
+    const year = d.getFullYear();
+    const month = d.getMonth() + 1;
+    const day = d.getDate();
+    const h = d.getHours();
+    const min = d.getMinutes();
+    const yy = String(year);
+    const mm = month < 10 ? '0' + month : String(month);
+    const dd = day < 10 ? '0' + day : String(day);
+    const hh = h < 10 ? '0' + h : String(h);
+    const mi = min < 10 ? '0' + min : String(min);
+    return yy + '-' + mm + '-' + dd + ' ' + hh + ':' + mi;
+  }
 }

@@ -115,7 +115,8 @@ export class SmbSession {
         continue;
       }
       const full = relPath.length === 0 ? e.name : relPath + '\\' + e.name;
-      out.push(VideoEntry.of(full, e.name, e.size, e.isDirectory));
+      out.push(VideoEntry.of(full, e.name, e.size, e.isDirectory,
+        SmbSession.fileTimeToMs(e.lastWriteTime)));
     }
     out.sort((a: VideoEntry, b: VideoEntry): number => {
       if (a.isDirectory !== b.isDirectory) {
@@ -170,6 +171,13 @@ export class SmbSession {
     const msg = e.message;
     return msg.indexOf('Network') >= 0 || msg.indexOf('socket') >= 0 || msg.indexOf('closed') >= 0 ||
       msg.indexOf('断开') >= 0 || msg.indexOf('connect') >= 0 || msg.indexOf('timeout') >= 0;
+  }
+
+  static fileTimeToMs(fileTime: number): number {
+    if (fileTime <= 0) {
+      return 0;
+    }
+    return Math.floor(fileTime / 10000) - 11644473600000;
   }
 
   private async reconnect(): Promise<void> {

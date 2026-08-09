@@ -1,9 +1,7 @@
-import { image } from '@kit.ImageKit';
 import { VideoEntry } from '../model/VideoEntry';
 import { BrowserParams, PlayerParams } from '../model/RouteParams';
 import { SmbService } from '../service/SmbService';
 import { MediaUtil } from '../service/MediaUtil';
-import { ThumbnailService } from '../service/ThumbnailService';
 
 class VideoDataSource implements IDataSource {
   private data: VideoEntry[] = [];
@@ -37,56 +35,76 @@ class VideoDataSource implements IDataSource {
 }
 
 @Component
-struct ThumbCell {
+struct VideoCell {
   @Prop path: string = '';
   @Prop name: string = '';
   @Prop fileSize: number = 0;
-  @State pm: image.PixelMap | undefined = undefined;
-
-  aboutToAppear(): void {
-    this.loadThumb();
-  }
-
-  async loadThumb(): Promise<void> {
-    const pm = await ThumbnailService.getInstance().request(this.path, this.fileSize);
-    if (pm !== undefined) {
-      this.pm = pm;
-    }
-  }
+  @Prop isDir: boolean = false;
+  @Prop modifiedTime: number = 0;
 
   build() {
-    Stack({ alignContent: Alignment.Center }) {
-      if (this.pm !== undefined) {
-        Image(this.pm)
-          .width('100%')
-          .height('100%')
-          .objectFit(ImageFit.Cover)
-      } else {
-        Column({ space: 4 }) {
-          Text('▶')
-            .fontSize(28)
-            .fontColor(Color.White)
-          Text(this.name)
-            .fontSize(11)
-            .fontColor(Color.White)
-            .maxLines(2)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .padding({ left: 6, right: 6 })
-            .textAlign(TextAlign.Center)
-          Text(MediaUtil.formatSize(this.fileSize))
-            .fontSize(10)
-            .fontColor('#AABBDD')
+    Row({ space: 10 }) {
+      if (this.isDir) {
+        Stack({ alignContent: Alignment.Center }) {
+          Text('📁')
+            .fontSize(20)
         }
-        .width('100%')
-        .height('100%')
-        .justifyContent(FlexAlign.Center)
+        .width(44)
+        .height(36)
+        .backgroundColor($r('app.color.card_bg'))
+        .borderRadius(6)
+      } else {
+        Stack({ alignContent: Alignment.Center }) {
+          Text(this.extText())
+            .fontSize(11)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Color.White)
+        }
+        .width(44)
+        .height(36)
+        .backgroundColor($r('app.color.poster_bg'))
+        .borderRadius(6)
+        .clip(true)
       }
+      Column({ space: 4 }) {
+        Text(this.name)
+          .fontSize(13)
+          .fontColor($r('app.color.text_main'))
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+        Text(this.metaText())
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
     }
     .width('100%')
-    .height(140)
-    .backgroundColor($r('app.color.poster_bg'))
-    .borderRadius(8)
-    .clip(true)
+    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+    .backgroundColor($r('app.color.card_bg'))
+    .borderRadius(10)
+  }
+
+  private extText(): string {
+    const idx = this.name.lastIndexOf('.');
+    if (idx < 0 || idx === this.name.length - 1) {
+      return '视频';
+    }
+    return this.name.substring(idx + 1).toUpperCase();
+  }
+
+  private metaText(): string {
+    if (this.isDir) {
+      return '文件夹';
+    }
+    const parts: string[] = [];
+    parts.push(MediaUtil.formatSize(this.fileSize));
+    parts.push(MediaUtil.formatTime(this.modifiedTime));
+    return parts.join('  ·  ');
   }
 }
 
@@ -97,9 +115,9 @@ export default struct BrowserPage {
   private source: VideoDataSource = new VideoDataSource();
   @State currentPath: string = '';
   @State loading: boolean = false;
-  @State gridMode: boolean = false;
   @State errorText: string = '';
   @State emptyText: string = '';
+  @State refreshing: boolean = false;
 
   aboutToAppear(): void {
     this.load(this.params.sharePath);
@@ -160,58 +178,9 @@ export default struct BrowserPage {
     }
   }
 
-  @Builder
-  VideoCell(entry: VideoEntry) {
-    Row({ space: 12 }) {
-      if (entry.isDirectory) {
-        Text('📁')
-          .fontSize(26)
-      } else {
-        Text('🎬')
-          .fontSize(26)
-      }
-      Column({ space: 4 }) {
-        Text(entry.name)
-          .fontSize(15)
-          .fontColor($r('app.color.text_main'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .width('100%')
-        Text(entry.isDirectory ? '文件夹' : MediaUtil.formatSize(entry.size))
-          .fontSize(12)
-          .fontColor($r('app.color.text_secondary'))
-          .width('100%')
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-    }
-    .width('100%')
-    .padding({ left: 14, right: 14, top: 10, bottom: 10 })
-    .backgroundColor($r('app.color.card_bg'))
-    .borderRadius(10)
-  }
-
   build() {
     NavDestination() {
       Column() {
-        Row({ space: 10 }) {
-          Text(this.currentPath.length > 0 ? this.currentPath.split('\\').pop() ?? this.currentPath : '共享根目录')
-            .fontSize(14)
-            .fontColor($r('app.color.text_secondary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
-          Button(this.gridMode ? '列表' : '海报墙')
-            .fontSize(12)
-            .height(30)
-            .backgroundColor($r('app.color.theme_primary'))
-            .onClick(() => {
-              this.gridMode = !this.gridMode;
-            })
-        }
-        .width('100%')
-        .padding({ left: 14, right: 14, bottom: 8 })
-
         if (this.loading) {
           Column({ space: 8 }) {
             LoadingProgress()
@@ -250,47 +219,37 @@ export default struct BrowserPage {
           .width('100%')
           .height('100%')
           .justifyContent(FlexAlign.Center)
-        } else if (this.gridMode) {
-          Grid() {
-            LazyForEach(this.source, (item: VideoEntry) => {
-              GridItem() {
-                Column({ space: 4 }) {
-                  ThumbCell({ path: item.path, name: item.name, fileSize: item.size })
-                  Text(item.name)
-                    .fontSize(12)
-                    .fontColor($r('app.color.text_main'))
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    .width('100%')
-                }
-                .width('100%')
-              }
-              .onClick(() => {
-                this.openEntry(item);
-              })
-            }, (item: VideoEntry) => item.path)
-          }
-          .columnsTemplate('1fr 1fr 1fr')
-          .columnsGap(8)
-          .rowsGap(10)
-          .padding({ left: 14, right: 14, bottom: 14 })
-          .width('100%')
-          .layoutWeight(1)
         } else {
-          List({ space: 8 }) {
-            LazyForEach(this.source, (item: VideoEntry) => {
-              ListItem() {
-                this.VideoCell(item)
-              }
-              .onClick(() => {
-                this.openEntry(item);
-              })
-            }, (item: VideoEntry) => item.path)
+          Refresh({ refreshing: $$this.refreshing }) {
+            List({ space: 8 }) {
+              LazyForEach(this.source, (item: VideoEntry) => {
+                ListItem() {
+                  VideoCell({
+                    path: item.path,
+                    name: item.name,
+                    fileSize: item.size,
+                    isDir: item.isDirectory,
+                    modifiedTime: item.modifiedTime
+                  })
+                }
+                .onClick(() => {
+                  this.openEntry(item);
+                })
+              }, (item: VideoEntry) => item.path)
+            }
+            .padding({ left: 14, right: 14, bottom: 14 })
+            .width('100%')
+            .layoutWeight(1)
+            .scrollBar(BarState.Off)
           }
-          .padding({ left: 14, right: 14, bottom: 14 })
-          .width('100%')
+          .onRefreshing(() => {
+            this.refreshing = true;
+            this.load(this.currentPath).finally(() => {
+              this.refreshing = false;
+            });
+          })
           .layoutWeight(1)
-          .scrollBar(BarState.Off)
+          .width('100%')
         }
       }
       .width('100%')

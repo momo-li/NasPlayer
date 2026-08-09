@@ -7,6 +7,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 const DOMAIN = 0x0000;
 const TAG = 'StreamServer';
 const CHUNK = 1048576;
+const SEND_TIMEOUT_MS = 5000;
 
 interface HttpRequest {
   method: string;
@@ -22,7 +23,6 @@ export class StreamServer {
   private running: boolean = false;
   private connections: socket.TCPSocketConnection[] = [];
   private lastServeError: string = '';
-  private queue: Promise<void> = Promise.resolve();
   private sizeCache: Map<string, number> = new Map<string, number>();
 
   static getInstance(): StreamServer {
@@ -76,6 +76,32 @@ export class StreamServer {
     hilog.info(DOMAIN, TAG, 'stream server listening on %{public}d', this.port);
   }
 
+  async restart(): Promise<void> {
+    if (this.running) {
+      this.running = false;
+      const s = this.server;
+      this.server = undefined;
+      if (s !== undefined) {
+        try {
+          await s.close();
+        } catch (e) {
+          hilog.debug(DOMAIN, TAG, 'restart close old failed: %{public}s', JSON.stringify(e));
+        }
+      }
+      const conns = this.connections;
+      this.connections = [];
+      for (let i = 0; i < conns.length; i++) {
+        try {
+          await conns[i].close();
+        } catch (e) {
+          hilog.debug(DOMAIN, TAG, 'restart close conn failed');
+        }
+      }
+      this.sizeCache.clear();
+    }
+    await this.start();
+  }
+
   async stop(): Promise<void> {
     if (!this.running) {
       return;
@@ -104,13 +130,25 @@ export class StreamServer {
   private handleConnection(conn: socket.TCPSocketConnection): void {
     this.connections.push(conn);
     let buffer = new Uint8Array(0);
+    let chain: Promise<void> = Promise.resolve();
     conn.on('message', (info: socket.SocketMessageInfo) => {
       const chunk = new Uint8Array(info.message);
       const merged = new Uint8Array(buffer.length + chunk.length);
       merged.set(buffer);
       merged.set(chunk, buffer.length);
       buffer = merged;
-      buffer = this.drainBuffer(conn, buffer);
+      let headerEnd = StreamServer.findHeaderEnd(buffer);
+      while (headerEnd >= 0) {
+        const headText = StreamServer.asciiDecode(buffer.slice(0, headerEnd));
+        const req = StreamServer.parseRequest(headText);
+        buffer = buffer.slice(headerEnd + 4);
+        headerEnd = StreamServer.findHeaderEnd(buffer);
+        chain = chain.then(async () => {
+          await this.serve(conn, req);
+        }).catch((e: BusinessError) => {
+          hilog.debug(DOMAIN, TAG, 'serve task error: %{public}s', JSON.stringify(e));
+        });
+      }
     });
     conn.on('close', () => {
       hilog.debug(DOMAIN, TAG, 'client connection closed');
@@ -119,36 +157,6 @@ export class StreamServer {
     conn.on('error', (err: BusinessError) => {
       hilog.debug(DOMAIN, TAG, 'client error: %{public}s', JSON.stringify(err));
       this.removeConnection(conn);
-    });
-  }
-
-  private drainBuffer(conn: socket.TCPSocketConnection, buffer: Uint8Array): Uint8Array {
-    let headerEnd = StreamServer.findHeaderEnd(buffer);
-    while (headerEnd >= 0) {
-      const headText = StreamServer.asciiDecode(buffer.slice(0, headerEnd));
-      const req = StreamServer.parseRequest(headText);
-      buffer = buffer.slice(headerEnd + 4);
-      headerEnd = StreamServer.findHeaderEnd(buffer);
-      this.enqueue(conn, req);
-    }
-    return buffer;
-  }
-
-  private async getCachedSize(relPath: string): Promise<number> {
-    const cached = this.sizeCache.get(relPath);
-    if (cached !== undefined) {
-      return cached;
-    }
-    const size = await SmbService.getInstance().getSize(relPath);
-    this.sizeCache.set(relPath, size);
-    return size;
-  }
-
-  private enqueue(conn: socket.TCPSocketConnection, req: HttpRequest): void {
-    this.queue = this.queue.then(async () => {
-      await this.serve(conn, req);
-    }).catch((e: BusinessError) => {
-      hilog.debug(DOMAIN, TAG, 'serve task error: %{public}s', JSON.stringify(e));
     });
   }
 
@@ -211,6 +219,16 @@ export class StreamServer {
       rangeEnd: rangeEnd
     };
     return req;
+  }
+
+  private async getCachedSize(relPath: string): Promise<number> {
+    const cached = this.sizeCache.get(relPath);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const size = await SmbService.getInstance().getSize(relPath);
+    this.sizeCache.set(relPath, size);
+    return size;
   }
 
   private async serve(conn: socket.TCPSocketConnection, req: HttpRequest): Promise<void> {
@@ -281,15 +299,27 @@ export class StreamServer {
         break;
       }
       const opts: socket.TCPSendOptions = { data: data.buffer as ArrayBuffer };
-      await conn.send(opts);
+      await StreamServer.sendWithTimeout(conn, opts);
       pos += data.length;
       remaining -= data.length;
     }
   }
 
+  private static async sendWithTimeout(conn: socket.TCPSocketConnection,
+    opts: socket.TCPSendOptions): Promise<void> {
+    await Promise.race([
+      conn.send(opts),
+      new Promise<void>((resolve, reject) => {
+        setTimeout(() => {
+          reject(new Error('发送超时'));
+        }, SEND_TIMEOUT_MS);
+      })
+    ]);
+  }
+
   private static async sendText(conn: socket.TCPSocketConnection, text: string): Promise<void> {
     const opts: socket.TCPSendOptions = { data: StreamServer.asciiEncode(text).buffer as ArrayBuffer };
-    await conn.send(opts);
+    await StreamServer.sendWithTimeout(conn, opts);
   }
 
   private static asciiEncode(s: string): Uint8Array {

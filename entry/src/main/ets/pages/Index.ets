@@ -5,7 +5,6 @@ import { BrowserParams, PlayerParams, SharesParams } from '../model/RouteParams'
 import { ConfigStore } from '../service/ConfigStore';
 import { NeighborScanner } from '../service/NeighborScanner';
 import { SmbService } from '../service/SmbService';
-import { ThumbnailService } from '../service/ThumbnailService';
 import { SmbError } from '../smb/SmbClient';
 import BrowserPage from './BrowserPage';
 import PlayerPage from './PlayerPage';
@@ -30,7 +29,6 @@ struct Index {
   @State dialogPassword: string = '';
 
   aboutToAppear(): void {
-    ThumbnailService.getInstance().init(this.getUIContext().getHostContext() as common.UIAbilityContext);
     this.loadCredentials();
     this.loadCachedHosts();
   }

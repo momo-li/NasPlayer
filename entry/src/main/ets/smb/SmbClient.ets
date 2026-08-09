@@ -490,10 +490,15 @@ export class SmbClient {
     } finally {
       await this.closeFile(dir.fileId);
     }
+    await this.probeEntries(relPath, entries);
+    return entries;
+  }
+
+  private async probeEntries(relPath: string, entries: QueryEntry[]): Promise<void> {
     const probes: QueryEntry[] = [];
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
-      if (e.name.indexOf('.') < 0) {
+      if (e.name !== '.' && e.name !== '..') {
         probes.push(e);
       }
     }
@@ -505,14 +510,23 @@ export class SmbClient {
           const d = await this.create(full, true);
           e.isDirectory = true;
           e.size = d.endOfFile;
+          e.lastWriteTime = d.lastWriteTime;
           await this.closeFile(d.fileId);
         } catch (err) {
-          e.isDirectory = false;
-          e.size = 0;
+          try {
+            const f = await this.create(full, false);
+            e.isDirectory = false;
+            e.size = f.endOfFile;
+            e.lastWriteTime = f.lastWriteTime;
+            await this.closeFile(f.fileId);
+          } catch (err2) {
+            e.isDirectory = false;
+            e.size = 0;
+            e.lastWriteTime = 0;
+          }
         }
       }));
     }
-    return entries;
   }
 
   async getSize(relPath: string): Promise<number> {
