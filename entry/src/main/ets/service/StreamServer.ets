@@ -6,7 +6,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const DOMAIN = 0x0000;
 const TAG = 'StreamServer';
-const CHUNK = 262144;
+const CHUNK = 1048576;
 
 interface HttpRequest {
   method: string;
@@ -20,6 +20,10 @@ export class StreamServer {
   private server: socket.TCPSocketServer | undefined = undefined;
   private port: number = 0;
   private running: boolean = false;
+  private connections: socket.TCPSocketConnection[] = [];
+  private lastServeError: string = '';
+  private queue: Promise<void> = Promise.resolve();
+  private sizeCache: Map<string, number> = new Map<string, number>();
 
   static getInstance(): StreamServer {
     return StreamServer.instance;
@@ -27,6 +31,10 @@ export class StreamServer {
 
   get isRunning(): boolean {
     return this.running;
+  }
+
+  getLastServeError(): string {
+    return this.lastServeError;
   }
 
   getPort(): number {
@@ -82,32 +90,73 @@ export class StreamServer {
         hilog.debug(DOMAIN, TAG, 'stop failed: %{public}s', JSON.stringify(e));
       }
     }
+    const conns = this.connections;
+    this.connections = [];
+    for (let i = 0; i < conns.length; i++) {
+      try {
+        await conns[i].close();
+      } catch (e) {
+        hilog.debug(DOMAIN, TAG, 'stop close conn failed');
+      }
+    }
   }
 
   private handleConnection(conn: socket.TCPSocketConnection): void {
+    this.connections.push(conn);
     let buffer = new Uint8Array(0);
-    let request: HttpRequest | undefined = undefined;
     conn.on('message', (info: socket.SocketMessageInfo) => {
       const chunk = new Uint8Array(info.message);
       const merged = new Uint8Array(buffer.length + chunk.length);
       merged.set(buffer);
       merged.set(chunk, buffer.length);
       buffer = merged;
-      if (request === undefined) {
-        const headerEnd = StreamServer.findHeaderEnd(buffer);
-        if (headerEnd >= 0) {
-          const headText = StreamServer.asciiDecode(buffer.slice(0, headerEnd));
-          request = StreamServer.parseRequest(headText);
-          this.serve(conn, request);
-        }
-      }
+      buffer = this.drainBuffer(conn, buffer);
     });
     conn.on('close', () => {
       hilog.debug(DOMAIN, TAG, 'client connection closed');
+      this.removeConnection(conn);
     });
     conn.on('error', (err: BusinessError) => {
       hilog.debug(DOMAIN, TAG, 'client error: %{public}s', JSON.stringify(err));
+      this.removeConnection(conn);
     });
+  }
+
+  private drainBuffer(conn: socket.TCPSocketConnection, buffer: Uint8Array): Uint8Array {
+    let headerEnd = StreamServer.findHeaderEnd(buffer);
+    while (headerEnd >= 0) {
+      const headText = StreamServer.asciiDecode(buffer.slice(0, headerEnd));
+      const req = StreamServer.parseRequest(headText);
+      buffer = buffer.slice(headerEnd + 4);
+      headerEnd = StreamServer.findHeaderEnd(buffer);
+      this.enqueue(conn, req);
+    }
+    return buffer;
+  }
+
+  private async getCachedSize(relPath: string): Promise<number> {
+    const cached = this.sizeCache.get(relPath);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const size = await SmbService.getInstance().getSize(relPath);
+    this.sizeCache.set(relPath, size);
+    return size;
+  }
+
+  private enqueue(conn: socket.TCPSocketConnection, req: HttpRequest): void {
+    this.queue = this.queue.then(async () => {
+      await this.serve(conn, req);
+    }).catch((e: BusinessError) => {
+      hilog.debug(DOMAIN, TAG, 'serve task error: %{public}s', JSON.stringify(e));
+    });
+  }
+
+  private removeConnection(conn: socket.TCPSocketConnection): void {
+    const idx = this.connections.indexOf(conn);
+    if (idx >= 0) {
+      this.connections.splice(idx, 1);
+    }
   }
 
   private static findHeaderEnd(buffer: Uint8Array): number {
@@ -171,49 +220,51 @@ export class StreamServer {
       if (qIdx >= 0) {
         relPath = decodeURIComponent(req.path.substring(qIdx + 3));
       }
+      hilog.info(DOMAIN, TAG, 'serve req method=%{public}s range=[%{public}s,%{public}s] path=%{public}s',
+        req.method, String(req.rangeStart), String(req.rangeEnd), relPath);
       if (relPath.length === 0) {
-        await StreamServer.sendText(conn, 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+        await StreamServer.sendText(conn, 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n');
         return;
       }
-      const size = await SmbService.getInstance().getSize(relPath);
+      const size = await this.getCachedSize(relPath);
+      hilog.info(DOMAIN, TAG, 'getSize ok size=%{public}d', size);
       const type = MediaUtil.contentType(relPath);
       if (req.method === 'HEAD') {
         await StreamServer.sendText(conn, 'HTTP/1.1 200 OK\r\nContent-Length: ' + size +
-          '\r\nAccept-Ranges: bytes\r\nContent-Type: ' + type + '\r\nConnection: close\r\n\r\n');
+          '\r\nAccept-Ranges: bytes\r\nContent-Type: ' + type + '\r\n\r\n');
+        hilog.info(DOMAIN, TAG, 'HEAD responded');
         return;
       }
       if (req.rangeStart !== undefined) {
         let start = req.rangeStart;
+        let end = size - 1;
         if (req.rangeEnd !== undefined && req.rangeEnd >= 0) {
-          start = Math.min(start, req.rangeEnd);
+          end = Math.min(end, req.rangeEnd);
+          start = Math.min(start, end);
         }
-        if (start >= size) {
-          await StreamServer.sendText(conn, 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+        if (start >= size || start > end) {
+          await StreamServer.sendText(conn, 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n');
           return;
         }
-        const end = size - 1;
         const len = end - start + 1;
         await StreamServer.sendText(conn, 'HTTP/1.1 206 Partial Content\r\nContent-Range: bytes ' + start +
           '-' + end + '/' + size + '\r\nContent-Length: ' + len +
-          '\r\nAccept-Ranges: bytes\r\nContent-Type: ' + type + '\r\nConnection: close\r\n\r\n');
+          '\r\nAccept-Ranges: bytes\r\nContent-Type: ' + type + '\r\n\r\n');
         await this.streamRange(conn, relPath, start, len);
+        hilog.info(DOMAIN, TAG, 'range stream done len=%{public}d', len);
       } else {
         await StreamServer.sendText(conn, 'HTTP/1.1 200 OK\r\nContent-Length: ' + size +
-          '\r\nAccept-Ranges: bytes\r\nContent-Type: ' + type + '\r\nConnection: close\r\n\r\n');
+          '\r\nAccept-Ranges: bytes\r\nContent-Type: ' + type + '\r\n\r\n');
         await this.streamRange(conn, relPath, 0, size);
+        hilog.info(DOMAIN, TAG, 'full stream done len=%{public}d', size);
       }
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'serve failed: %{public}s', JSON.stringify(e));
+      this.lastServeError = JSON.stringify(e);
       try {
-        await StreamServer.sendText(conn, 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+        await StreamServer.sendText(conn, 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n');
       } catch (e2) {
         hilog.debug(DOMAIN, TAG, 'send 404 failed');
-      }
-    } finally {
-      try {
-        await conn.close();
-      } catch (e) {
-        hilog.debug(DOMAIN, TAG, 'close conn failed');
       }
     }
   }
@@ -226,6 +277,7 @@ export class StreamServer {
       const n = Math.min(CHUNK, remaining);
       const data = await SmbService.getInstance().readRange(relPath, pos, n);
       if (data.length === 0) {
+        hilog.warn(DOMAIN, TAG, 'streamRange read empty at pos=%{public}d remaining=%{public}d', pos, remaining);
         break;
       }
       const opts: socket.TCPSendOptions = { data: data.buffer as ArrayBuffer };

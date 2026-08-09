@@ -12,6 +12,8 @@ const DIALECT_3_1_1 = 0x0311;
 const DIALECT_3_0 = 0x0300;
 const REQUEST_TIMEOUT_MS = 30000;
 const MAX_READ_CHUNK = 65536;
+const READ_TRIAL_CHUNK = 262144;
+const STATUS_INVALID_PARAMETER = 0xc000000d;
 
 export class SmbError extends Error {
   readonly status: number;
@@ -528,21 +530,26 @@ export class SmbClient {
       const chunks: Uint8Array[] = [];
       let remaining = length;
       let pos = offset;
+      const flight: Promise<Uint8Array>[] = [];
+      const FLIGHT_LIMIT = 8;
       while (remaining > 0) {
         const n = Math.min(MAX_READ_CHUNK, remaining);
-        const body = SmbPacket.readReq(f.fileId, pos, n);
-        const resp = await this.sendRequest(SmbCommand.READ, body, true, true, true, false, false);
-        const hdr = SmbPacket.parseHeader(resp);
-        if (hdr.status !== SmbStatus.SUCCESS) {
-      throw new SmbError(hdr.status, '[PIPE] ' + SmbStatus.describe(hdr.status));
+        flight.push(this.readChunk(f.fileId, pos, n));
+        pos += n;
+        remaining -= n;
+        if (flight.length >= FLIGHT_LIMIT) {
+          const batch = await Promise.all(flight);
+          for (let i = 0; i < batch.length; i++) {
+            chunks.push(batch[i]);
+          }
+          flight.length = 0;
         }
-        const data = SmbPacket.parseReadResp(SmbPacket.body(resp));
-        if (data.length === 0) {
-          break;
+      }
+      if (flight.length > 0) {
+        const batch = await Promise.all(flight);
+        for (let i = 0; i < batch.length; i++) {
+          chunks.push(batch[i]);
         }
-        chunks.push(data);
-        pos += data.length;
-        remaining -= data.length;
       }
       if (chunks.length === 0) {
         return new Uint8Array(0);
@@ -551,6 +558,16 @@ export class SmbClient {
     } finally {
       await this.closeFile(f.fileId);
     }
+  }
+
+  private async readChunk(fileId: Uint8Array, offset: number, length: number): Promise<Uint8Array> {
+    const body = SmbPacket.readReq(fileId, offset, length);
+    const resp = await this.sendRequest(SmbCommand.READ, body, true, true, true, false, false);
+    const hdr = SmbPacket.parseHeader(resp);
+    if (hdr.status !== SmbStatus.SUCCESS) {
+      throw new SmbError(hdr.status, '[READ] ' + SmbStatus.describe(hdr.status));
+    }
+    return SmbPacket.parseReadResp(SmbPacket.body(resp));
   }
 
   async disconnect(): Promise<void> {

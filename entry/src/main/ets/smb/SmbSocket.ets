@@ -11,6 +11,7 @@ export class SmbSocket {
   private closed: boolean = false;
   private onMessageCb: ((msg: Uint8Array) => void) | undefined = undefined;
   private onClosedCb: (() => void) | undefined = undefined;
+  private sendChain: Promise<void> = Promise.resolve();
 
   get isClosed(): boolean {
     return this.closed;
@@ -64,7 +65,14 @@ export class SmbSocket {
     wrapped[3] = data.length & 0xff;
     wrapped.set(data, 4);
     const opts: socket.TCPSendOptions = { data: wrapped.buffer as ArrayBuffer };
-    await this.tcp.send(opts);
+    const task = this.sendChain.then(async () => {
+      if (this.closed || this.tcp === undefined) {
+        throw new Error('socket closed');
+      }
+      await this.tcp.send(opts);
+    });
+    this.sendChain = task.catch(() => undefined);
+    await task;
   }
 
   async close(): Promise<void> {

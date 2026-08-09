@@ -18,7 +18,7 @@ export default struct PlayerPage {
   private hideTimer: number = -1;
   private dragging: boolean = false;
   private startupDone: boolean = false;
-  private autoRetrying: boolean = false;
+  private destroyed: boolean = false;
   @State isLandscape: boolean = false;
   private resumePosition: number = 0;
 
@@ -88,13 +88,21 @@ export default struct PlayerPage {
   }
 
   aboutToDisappear(): void {
+    hilog.info(0x0000, 'NasPlayer', 'player aboutToDisappear');
     this.exitLandscape();
     this.cleanup();
   }
 
   onPageHide(): void {
+    hilog.info(0x0000, 'NasPlayer', 'player onPageHide');
     this.exitLandscape();
     this.pauseIfPlaying();
+  }
+
+  private onWillDisappear(): void {
+    hilog.info(0x0000, 'NasPlayer', 'player onWillDisappear');
+    this.exitLandscape();
+    this.cleanup();
   }
 
   private showToast(msg: string): void {
@@ -133,6 +141,8 @@ export default struct PlayerPage {
   }
 
   private async cleanup(): Promise<void> {
+    hilog.info(0x0000, 'NasPlayer', 'player cleanup start, hasPlayer=%{public}s', String(this.avPlayer !== undefined));
+    this.destroyed = true;
     if (this.hideTimer >= 0) {
       clearTimeout(this.hideTimer);
       this.hideTimer = -1;
@@ -142,11 +152,13 @@ export default struct PlayerPage {
     if (p !== undefined) {
       try {
         await p.release();
+        hilog.info(0x0000, 'NasPlayer', 'player release done');
       } catch (e) {
         console.error('release player failed: ' + JSON.stringify(e));
       }
     }
     await StreamServer.getInstance().stop();
+    hilog.info(0x0000, 'NasPlayer', 'player cleanup done');
   }
 
   private pauseIfPlaying(): void {
@@ -158,6 +170,7 @@ export default struct PlayerPage {
 
   private attachEvents(player: media.AVPlayer): void {
     player.on('stateChange', (state: media.AVPlayerState) => {
+      hilog.info(0x0000, 'NasPlayer', 'avplayer stateChange -> %{public}s', state);
       if (state === 'playing') {
         this.playing = true;
         this.errorMsg = '';
@@ -179,10 +192,8 @@ export default struct PlayerPage {
     });
     player.on('error', (err: BusinessError) => {
       console.error('player error: ' + JSON.stringify(err));
-      if (!this.autoRetrying) {
-        this.loading = false;
-        this.errorMsg = '播放失败，请确认视频格式受支持';
-      }
+      this.loading = false;
+      this.errorMsg = PlayerPage.describePlayerError(err, StreamServer.getInstance().getLastServeError());
     });
     player.on('endOfStream', () => {
       this.completed = true;
@@ -203,9 +214,12 @@ export default struct PlayerPage {
       }
       const timer = setTimeout(() => {
         player.off('stateChange', handler);
+        hilog.info(0x0000, 'NasPlayer', 'waitForState timeout, want=%{public}s cur=%{public}s',
+          target, player.state);
         resolve(false);
       }, timeoutMs);
       const handler = (state: media.AVPlayerState): void => {
+        hilog.info(0x0000, 'NasPlayer', 'waitForState see %{public}s want %{public}s', state, target);
         if (state === target) {
           clearTimeout(timer);
           player.off('stateChange', handler);
@@ -220,7 +234,12 @@ export default struct PlayerPage {
     });
   }
 
-  private async playEntry(entry: VideoEntry, retryCount: number = 0): Promise<void> {
+  private async playEntry(entry: VideoEntry): Promise<void> {
+    hilog.info(0x0000, 'NasPlayer', 'playEntry start, destroyed=%{public}s, surface=%{public}s',
+      String(this.destroyed), this.surfaceId);
+    if (this.destroyed) {
+      return;
+    }
     this.loading = true;
     this.errorMsg = '';
     this.completed = false;
@@ -228,24 +247,33 @@ export default struct PlayerPage {
     this.duration = 0;
     try {
       await StreamServer.getInstance().start();
+      hilog.info(0x0000, 'NasPlayer', 'playEntry: stream server started, port=%{public}d',
+        StreamServer.getInstance().getPort());
       let player = this.avPlayer;
       if (player === undefined) {
         player = await media.createAVPlayer();
         this.attachEvents(player);
         this.avPlayer = player;
+        hilog.info(0x0000, 'NasPlayer', 'playEntry: avplayer created');
       } else {
         await player.reset();
+        hilog.info(0x0000, 'NasPlayer', 'playEntry: avplayer reset');
       }
       if (this.surfaceId.length === 0) {
         throw new Error('视频 surface 未就绪');
       }
-      player.url = StreamServer.getInstance().urlFor(entry.path);
+      const url = StreamServer.getInstance().urlFor(entry.path);
+      player.url = url;
+      hilog.info(0x0000, 'NasPlayer', 'playEntry: url set, state=%{public}s', player.state);
       const ready = await this.waitForState(player, 'initialized', 15000);
+      hilog.info(0x0000, 'NasPlayer', 'playEntry: wait initialized ready=%{public}s state=%{public}s',
+        String(ready), player.state);
       if (!ready) {
         throw new Error('视频源加载超时');
       }
       player.surfaceId = this.surfaceId;
       await player.prepare();
+      hilog.info(0x0000, 'NasPlayer', 'playEntry: prepared, state=%{public}s', player.state);
       try {
         player.videoScaleType = this.scaleValues[this.scaleIdx];
       } catch (e) {
@@ -265,35 +293,70 @@ export default struct PlayerPage {
         player.setSpeed(this.speedValues[this.speedIdx]);
       }
       await player.play();
-      this.autoRetrying = false;
+      hilog.info(0x0000, 'NasPlayer', 'playEntry: play() ok, state=%{public}s', player.state);
       this.errorMsg = '';
       this.loading = false;
     } catch (e) {
       console.error('play failed: ' + JSON.stringify(e));
-      if (retryCount < 3) {
-        hilog.info(0x0000, 'NasPlayer', 'play failed, auto retry %{public}d', retryCount + 1);
-        this.autoRetrying = true;
-        try {
-          const old = this.avPlayer;
-          this.avPlayer = undefined;
-          if (old !== undefined) {
-            await old.release();
-          }
-        } catch (e2) {
-          console.error('release old player failed: ' + JSON.stringify(e2));
-        }
-        await new Promise<void>((r) => {
-          setTimeout(() => {
-            r();
-          }, 1000);
-        });
-        await this.playEntry(entry, retryCount + 1);
-        return;
-      }
-      this.autoRetrying = false;
+      hilog.error(0x0000, 'NasPlayer', 'playEntry failed: %{public}s', JSON.stringify(e));
       this.loading = false;
-      this.errorMsg = '播放失败，请确认视频格式受支持';
+      this.errorMsg = PlayerPage.describePlayFailure(e, StreamServer.getInstance().getLastServeError());
     }
+  }
+
+  private static describePlayFailure(e: Object, serveErr: string): string {
+    if (e instanceof Error) {
+      const msg = e.message;
+      if (msg.indexOf('surface') >= 0) {
+        return '视频画面初始化失败，请重试';
+      }
+      if (msg.indexOf('超时') >= 0) {
+        return '视频加载超时，请检查网络或稍后重试';
+      }
+      if (msg.indexOf('流服务') >= 0) {
+        return '本地流服务启动失败，请重启应用';
+      }
+    }
+    const detail = JSON.stringify(e);
+    if (detail.indexOf('5400102') >= 0) {
+      if (serveErr.length > 0) {
+        return PlayerPage.describeServeError(serveErr);
+      }
+      return '视频加载失败：无法获取视频数据，请检查网络后重试';
+    }
+    if (detail.indexOf('5400103') >= 0) {
+      return '视频读取失败：网络中断或文件不可读，请检查网络';
+    }
+    if (detail.indexOf('5400101') >= 0) {
+      return '系统内存不足，无法创建播放器';
+    }
+    return '播放失败，请确认视频格式受支持';
+  }
+
+  private static describePlayerError(err: BusinessError, serveErr: string): string {
+    if (err.code === 5400102 && serveErr.length > 0) {
+      return PlayerPage.describeServeError(serveErr);
+    }
+    if (err.code === 5400103) {
+      return '视频读取失败：网络中断或文件不可读，请检查网络';
+    }
+    if (err.code === 5400101) {
+      return '系统内存不足，无法创建播放器';
+    }
+    return '播放失败，请确认视频格式受支持';
+  }
+
+  private static describeServeError(serveErr: string): string {
+    if (serveErr.indexOf('2303200') >= 0 || serveErr.indexOf('Network is down') >= 0) {
+      return '网络连接已断开，无法读取视频数据，请检查网络后重试';
+    }
+    if (serveErr.indexOf('2303111') >= 0 || serveErr.indexOf('unavailable') >= 0) {
+      return '本地流服务繁忙，请稍后重试';
+    }
+    if (serveErr.indexOf('2303199') >= 0 || serveErr.indexOf('Address not available') >= 0) {
+      return '无法访问视频文件，请确认文件路径正确';
+    }
+    return '视频加载失败：本地流服务异常，请重试';
   }
 
   private async togglePlay(): Promise<void> {
@@ -553,6 +616,13 @@ export default struct PlayerPage {
     }
     .hideTitleBar(true)
     .backgroundColor($r('app.color.player_bg'))
+    .onWillDisappear(() => {
+      this.onWillDisappear();
+    })
+    .onHidden(() => {
+      this.exitLandscape();
+      this.pauseIfPlaying();
+    })
   }
 }
 
