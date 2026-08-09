@@ -11,7 +11,7 @@ const NTLM_FLAGS: number = 0x00000001 | 0x00000004 | 0x00000200 | 0x00008000 |
 
 export class Ntlm {
   static async createType1(): Promise<Uint8Array> {
-    const w = new ByteWriter(32);
+    const w = new ByteWriter(40);
     w.bytes(SmbCrypto.asciiEncode('NTLMSSP\u0000'));
     w.u32le(1);
     w.u32le(NTLM_FLAGS);
@@ -21,6 +21,11 @@ export class Ntlm {
     w.u16le(0);
     w.u16le(0);
     w.u32le(0);
+    w.u8(6);
+    w.u8(1);
+    w.u16le(0x1f40);
+    w.bytes(new Uint8Array(3));
+    w.u8(0x0f);
     return w.finish();
   }
 

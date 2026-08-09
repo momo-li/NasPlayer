@@ -251,22 +251,22 @@ export class SmbPacket {
     return raw.slice(SMB2_HEADER_LEN);
   }
 
-  static negotiateReq(clientGuid: Uint8Array, legacy: boolean): Uint8Array {
-    const dialects: number[] = legacy ? [0x0202, 0x0210] : [0x0202, 0x0210, 0x0300, 0x0302, 0x0311];
+  static negotiateReq(clientGuid: Uint8Array, host: string): Uint8Array {
+    const dialects: number[] = [0x0202, 0x0210, 0x0300, 0x0302, 0x0311];
     const salt = new Uint8Array(32);
     for (let i = 0; i < 32; i++) {
       salt[i] = Math.floor(Math.random() * 256);
     }
-    const ctxData = new Uint8Array(38);
-    SmbPacket.writeU16(ctxData, 0, 1);
-    SmbPacket.writeU16(ctxData, 2, 32);
-    SmbPacket.writeU16(ctxData, 4, 1);
-    ctxData.set(salt, 6);
-    const preauthCtx = new Uint8Array(8 + 38);
-    SmbPacket.writeU16(preauthCtx, 0, 1);
-    SmbPacket.writeU16(preauthCtx, 2, 38);
-    preauthCtx.set(ctxData, 8);
-    const pad8 = (b: Uint8Array): Uint8Array => {
+    const mkCtx = (t: number, caps: Uint8Array): Uint8Array => {
+      const out = new Uint8Array(8 + caps.length);
+      out[0] = t & 0xff;
+      out[1] = (t >> 8) & 0xff;
+      out[2] = caps.length & 0xff;
+      out[3] = (caps.length >> 8) & 0xff;
+      out.set(caps, 8);
+      return out;
+    };
+    const padCtx = (b: Uint8Array): Uint8Array => {
       const r = b.length % 8;
       if (r === 0) {
         return b;
@@ -275,7 +275,20 @@ export class SmbPacket {
       out.set(b);
       return out;
     };
-    const ctxList = pad8(preauthCtx);
+    const preauthCaps = new Uint8Array(38);
+    preauthCaps.set([0x01, 0x00, 0x20, 0x00, 0x01, 0x00], 0);
+    preauthCaps.set(salt, 6);
+    const cipherCaps = new Uint8Array([0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00]);
+    const hn = SmbCrypto.utf16leEncode(host);
+    const netnameCaps = new Uint8Array(hn.length);
+    netnameCaps.set(hn, 0);
+    const signingCaps = new Uint8Array([0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00]);
+    const ctxList = SmbCrypto.concat([
+      padCtx(mkCtx(1, preauthCaps)),
+      padCtx(mkCtx(2, cipherCaps)),
+      padCtx(mkCtx(5, netnameCaps)),
+      mkCtx(8, signingCaps)
+    ]);
     const dialectsBuf = new Uint8Array(dialects.length * 2);
     for (let i = 0; i < dialects.length; i++) {
       SmbPacket.writeU16(dialectsBuf, i * 2, dialects[i]);
@@ -290,7 +303,7 @@ export class SmbPacket {
     const ctxOffset = 64 + 36 + dialectsBuf.length;
     const padLen = ctxOffset % 8 === 0 ? 0 : 8 - (ctxOffset % 8);
     SmbPacket.writeU32(f, 28, ctxOffset + padLen);
-    SmbPacket.writeU16(f, 32, 1);
+    SmbPacket.writeU16(f, 32, 4);
     SmbPacket.writeU16(f, 34, 0);
     const out = new Uint8Array(36 + dialectsBuf.length + padLen + ctxList.length);
     out.set(f, 0);
@@ -373,6 +386,52 @@ export class SmbPacket {
     return body.slice(off - SMB2_HEADER_LEN, off - SMB2_HEADER_LEN + len);
   }
 
+  private static asn1Len(len: number): Uint8Array {
+    if (len < 0x80) {
+      return new Uint8Array([len]);
+    }
+    if (len < 0x100) {
+      return new Uint8Array([0x81, len]);
+    }
+    return new Uint8Array([0x82, (len >> 8) & 0xff, len & 0xff]);
+  }
+
+  static spnegoType1(type1: Uint8Array): Uint8Array {
+    const oid = new Uint8Array([0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a]);
+    const mechType = SmbCrypto.concat([new Uint8Array([0xa0, 0x0e, 0x30, 0x0c, 0x06, 0x0a]), oid]);
+    const octet = SmbCrypto.concat([new Uint8Array([0x04, type1.length]), type1]);
+    const mechToken = SmbCrypto.concat([new Uint8Array([0xa2, octet.length]), octet]);
+    const seq = SmbCrypto.concat([new Uint8Array([0x30, mechType.length + mechToken.length]), mechType, mechToken]);
+    const mechList = SmbCrypto.concat([new Uint8Array([0xa0, seq.length]), seq]);
+    const inner = SmbCrypto.concat([new Uint8Array([0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02]), mechList]);
+    return SmbCrypto.concat([new Uint8Array([0x60, inner.length]), inner]);
+  }
+
+  static spnegoWrapType3(type3: Uint8Array): Uint8Array {
+    const octet = SmbCrypto.concat([new Uint8Array([0x04]), SmbPacket.asn1Len(type3.length), type3]);
+    const respTok = SmbCrypto.concat([new Uint8Array([0xa2]), SmbPacket.asn1Len(octet.length), octet]);
+    const negState = new Uint8Array([0xa0, 0x03, 0x0a, 0x01, 0x01]);
+    const seq = SmbCrypto.concat([new Uint8Array([0x30]), SmbPacket.asn1Len(negState.length + respTok.length), negState, respTok]);
+    return SmbCrypto.concat([new Uint8Array([0xa1]), SmbPacket.asn1Len(seq.length), seq]);
+  }
+
+  static extractNtlmFromSpnego(blob: Uint8Array): Uint8Array {
+    const magic = SmbCrypto.asciiEncode('NTLMSSP\u0000');
+    for (let i = 0; i + magic.length <= blob.length; i++) {
+      let ok = true;
+      for (let j = 0; j < magic.length; j++) {
+        if (blob[i + j] !== magic[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        return blob.slice(i);
+      }
+    }
+    return blob;
+  }
+
   static treeConnectReq(uncPath: string): Uint8Array {
     const path = SmbCrypto.utf16leEncode(uncPath);
     const w = new ByteWriter(8 + path.length);
@@ -394,7 +453,8 @@ export class SmbPacket {
 
   private static createReqWithAccess(fileName: string, isDirectory: boolean, accessMask: number): Uint8Array {
     const name = SmbCrypto.utf16leEncode(fileName);
-    const w = new ByteWriter(56 + name.length);
+    const bufLen = name.length === 0 ? 1 : name.length;
+    const w = new ByteWriter(56 + bufLen);
     w.u16le(57);
     w.u8(0);
     w.u8(0);
@@ -402,15 +462,19 @@ export class SmbPacket {
     w.u64le(0);
     w.u64le(0);
     w.u32le(accessMask);
-    w.u32le(0);
+    w.u32le(isDirectory ? 0x10 : 0);
     w.u32le(0x7);
     w.u32le(0x1);
-    w.u32le(isDirectory ? 0x00200000 : 0);
+    w.u32le(isDirectory ? 0x00000001 : 0);
     w.u16le(120);
     w.u16le(name.length);
     w.u32le(0);
     w.u32le(0);
-    w.bytes(name);
+    if (name.length === 0) {
+      w.u8(0);
+    } else {
+      w.bytes(name);
+    }
     return w.finish();
   }
 
@@ -420,7 +484,6 @@ export class SmbPacket {
     r.u8();
     r.u8();
     r.u32le();
-    r.u64le();
     r.u64le();
     r.u64le();
     r.u64le();
@@ -437,12 +500,12 @@ export class SmbPacket {
     return info;
   }
 
-  static queryDirectoryReq(fileId: Uint8Array): Uint8Array {
+  static queryDirectoryReq(fileId: Uint8Array, restart: boolean): Uint8Array {
     const pattern = SmbCrypto.utf16leEncode('*');
     const w = new ByteWriter(32 + pattern.length);
     w.u16le(33);
-    w.u8(3);
-    w.u8(0);
+    w.u8(0x0c);
+    w.u8(restart ? 0x01 : 0x00);
     w.u32le(0);
     w.bytes(fileId);
     w.u16le(96);
@@ -460,41 +523,32 @@ export class SmbPacket {
     const data = body.slice(off - SMB2_HEADER_LEN, off - SMB2_HEADER_LEN + len);
     const entries: QueryEntry[] = [];
     const er = new ByteReader(data);
-    while (er.remaining() >= 4) {
+    while (er.remaining() >= 12) {
       const next = er.u32le();
       er.u32le();
-      er.u64le();
-      er.u64le();
-      er.u64le();
-      er.u64le();
-      const endOfFile = er.u64le();
-      er.u64le();
-      const attributes = er.u32le();
       const nameLen = er.u32le();
-      er.u32le();
-      er.u8();
-      er.u8();
-      er.bytes(24);
+      if (nameLen === 0 || er.remaining() < nameLen) {
+        break;
+      }
       const name = SmbCrypto.utf16leDecode(er.bytes(nameLen));
-      const isDir = (attributes & 0x10) !== 0;
       const entry: QueryEntry = {
         name: name,
-        isDirectory: isDir,
-        size: endOfFile
+        isDirectory: false,
+        size: 0
       };
       entries.push(entry);
       if (next === 0 || er.remaining() < 4) {
         break;
       }
-      er.position = er.position + next - (94 + nameLen);
+      er.position = er.position + next - (12 + nameLen);
     }
     return entries;
   }
 
   static readReq(fileId: Uint8Array, offset: number, length: number): Uint8Array {
-    const w = new ByteWriter(48);
+    const w = new ByteWriter(49);
     w.u16le(49);
-    w.u8(0);
+    w.u8(0x50);
     w.u8(0);
     w.u32le(length);
     w.u64le(offset);
@@ -504,6 +558,7 @@ export class SmbPacket {
     w.u32le(0);
     w.u16le(0);
     w.u16le(0);
+    w.u8(0);
     return w.finish();
   }
 
@@ -511,8 +566,8 @@ export class SmbPacket {
     const r = new ByteReader(body);
     r.u16le();
     const off = r.u16le();
-    r.u32le();
     const len = r.u32le();
+    r.u32le();
     return body.slice(off - SMB2_HEADER_LEN, off - SMB2_HEADER_LEN + len);
   }
 
@@ -567,39 +622,48 @@ export class SmbPacket {
     w.u16le(72);
     w.u16le(0);
     w.u32le(callId);
-    w.u16le(0x1000);
-    w.u16le(0x1000);
+    w.u16le(0x10b8);
+    w.u16le(0x10b8);
     w.u32le(0);
     w.u8(1);
     w.u8(0);
     w.u16le(0);
+    w.u16le(0);
+    w.u8(1);
+    w.u8(0);
     w.bytes(srvsvcUuid);
-    w.u16le(1);
-    w.u16le(0);
+    w.u32le(3);
     w.bytes(ndrUuid);
-    w.u16le(2);
-    w.u16le(0);
+    w.u32le(2);
     return w.finish();
   }
 
-  static rpcNetShareEnumPdu(callId: number): Uint8Array {
-    const w = new ByteWriter(48);
+  static rpcNetShareEnumPdu(callId: number, host: string): Uint8Array {
+    const name = SmbCrypto.utf16leEncode('\\\\' + host + '\u0000');
+    const w = new ByteWriter(104);
     w.u8(5);
     w.u8(0);
     w.u8(0x00);
     w.u8(0x03);
     w.u32le(0x00000010);
-    w.u16le(48);
+    w.u16le(104);
     w.u16le(0);
     w.u32le(callId);
-    w.u32le(24);
+    w.u32le(80);
     w.u16le(0);
     w.u16le(15);
+    w.u32le(0x0000131a);
+    w.u32le(16);
     w.u32le(0);
+    w.u32le(16);
+    w.bytes(name);
     w.u32le(1);
+    w.u32le(1);
+    w.u32le(0x00007f3a);
+    w.u32le(0);
     w.u32le(0);
     w.u32le(0xffffffff);
-    w.u32le(0);
+    w.u32le(0x00005df1);
     w.u32le(0);
     return w.finish();
   }
@@ -612,24 +676,51 @@ export class SmbPacket {
     const r = new ByteReader(stub);
     r.u32le();
     r.u32le();
-    const total = r.u32le();
+    r.u32le();
+    const entriesRead = r.u32le();
+    r.u32le();
+    r.u32le();
     const entries: RpcShareInfo[] = [];
-    if (total <= 0 || r.remaining() < 12) {
+    if (entriesRead <= 0 || r.remaining() < entriesRead * 12) {
       return entries;
     }
-    r.u32le();
-    r.u32le();
-    r.u32le();
-    for (let i = 0; i < total; i++) {
+    const names: number[] = [];
+    for (let i = 0; i < entriesRead; i++) {
       const namePtr = r.u32le();
       const type = r.u32le();
       const remarkPtr = r.u32le();
       const info: RpcShareInfo = {
-        name: SmbPacket.readUnicodeAt(stub, namePtr),
+        name: '',
         type: type,
-        remark: SmbPacket.readUnicodeAt(stub, remarkPtr)
+        remark: ''
       };
       entries.push(info);
+      names.push(namePtr, remarkPtr);
+    }
+    const strSec = stub.slice(24 + entriesRead * 12);
+    const wstrs: string[] = [];
+    let wp = 0;
+    while (wp + 12 <= strSec.length) {
+      const actual = SmbPacket.readU32(strSec, wp + 8);
+      const dataLen = actual * 2;
+      if (wp + 12 + dataLen > strSec.length) {
+        break;
+      }
+      let s = '';
+      for (let i = 0; i < actual; i++) {
+        const c = SmbPacket.readU16(strSec, wp + 12 + i * 2);
+        if (c === 0) {
+          break;
+        }
+        s += String.fromCharCode(c);
+      }
+      wstrs.push(s);
+      wp = wp + 12 + dataLen;
+      wp += (4 - (wp % 4)) % 4;
+    }
+    for (let i = 0; i < entries.length; i++) {
+      entries[i].name = i * 2 < wstrs.length ? wstrs[i * 2] : '';
+      entries[i].remark = i * 2 + 1 < wstrs.length ? wstrs[i * 2 + 1] : '';
     }
     return entries;
   }

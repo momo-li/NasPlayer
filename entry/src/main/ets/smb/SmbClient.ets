@@ -161,9 +161,9 @@ export class SmbClient {
     return resp;
   }
 
-  private async negotiate(legacy: boolean): Promise<void> {
+  private async negotiate(): Promise<void> {
     const guid = await SmbCrypto.randomBytes(16);
-    const body = SmbPacket.negotiateReq(guid, legacy);
+    const body = SmbPacket.negotiateReq(guid, this.host);
     const id = this.nextMessageId();
     this.preauthNegotiateReq = SmbPacket.build(SmbCommand.NEGOTIATE, id, 0, 0, 0, this.processId, 0, body);
     this.preauthMsgs = [];
@@ -184,7 +184,8 @@ export class SmbClient {
 
   private async sessionSetupStep1(): Promise<void> {
     const type1 = await Ntlm.createType1();
-    const body = SmbPacket.sessionSetupReq(type1, undefined, undefined);
+    const blob = SmbPacket.spnegoType1(type1);
+    const body = SmbPacket.sessionSetupReq(blob, undefined, undefined);
     const resp = await this.sendRequest(SmbCommand.SESSION_SETUP, body, false, false, false, true, true);
     const hdr = SmbPacket.parseHeader(resp);
     if (hdr.status !== SmbStatus.MORE_PROCESSING_REQUIRED) {
@@ -193,7 +194,8 @@ export class SmbClient {
     this.sessionIdLo = hdr.sessionIdLo;
     this.sessionIdHi = hdr.sessionIdHi;
     this.preauthStep1Resp = resp;
-    const type2 = SmbPacket.parseSessionSetupResp(SmbPacket.body(resp));
+    let type2 = SmbPacket.parseSessionSetupResp(SmbPacket.body(resp));
+    type2 = SmbPacket.extractNtlmFromSpnego(type2);
     this.serverChallenge = await Ntlm.parseType2(type2);
     const tiLen = SmbPacket.readU16(type2, 40);
     const tiOff = SmbPacket.readU32(type2, 44);
@@ -210,7 +212,7 @@ export class SmbClient {
     this.sessionKey = type3.sessionKey;
 
     const id = this.nextMessageId();
-    const body = SmbPacket.sessionSetupReq(type3.message, undefined, undefined);
+    const body = SmbPacket.sessionSetupReq(SmbPacket.spnegoWrapType3(type3.message), undefined, undefined);
 
     const raw = SmbPacket.build(SmbCommand.SESSION_SETUP, id, this.sessionIdLo, this.sessionIdHi,
       0, this.processId, 0, body);
@@ -240,7 +242,7 @@ export class SmbClient {
   }
 
   async connect(host: string, share: string, username: string, password: string, domain: string,
-    port: number, legacy: boolean): Promise<void> {
+    port: number): Promise<void> {
     this.host = host;
     this.share = share;
     this.username = username;
@@ -254,7 +256,7 @@ export class SmbClient {
       this.onClosed();
     });
 
-    hilog.info(DOMAIN, TAG, 'connecting %{public}s:%{public}d legacy=%{public}s', host, port, String(legacy));
+    hilog.info(DOMAIN, TAG, 'connecting %{public}s:%{public}d', host, port);
     try {
       await this.socket.connect(host, port);
     } catch (e) {
@@ -263,7 +265,7 @@ export class SmbClient {
       throw e as Error;
     }
     hilog.info(DOMAIN, TAG, 'tcp connected');
-    await this.negotiate(legacy);
+    await this.negotiate();
     hilog.info(DOMAIN, TAG, 'negotiate done dialect=0x%{public}x', this.dialectRevision);
     try {
       await this.sessionSetupStep1();
@@ -335,23 +337,21 @@ export class SmbClient {
   }
 
   private async pipeWriteRpc(fileId: Uint8Array, data: Uint8Array): Promise<void> {
-    const framed = new Uint8Array(data.length + 4);
-    framed[0] = 0x00;
-    framed[1] = (data.length >> 16) & 0xff;
-    framed[2] = (data.length >> 8) & 0xff;
-    framed[3] = data.length & 0xff;
-    framed.set(data, 4);
-    await this.pipeWrite(fileId, framed);
+    await this.pipeWrite(fileId, data);
   }
 
   private async pipeRead(fileId: Uint8Array): Promise<Uint8Array> {
     const body = SmbPacket.readReq(fileId, 0, 65536);
+    hilog.info(DOMAIN, TAG, 'pipeRead req=%{public}s', body.toString());
     const resp = await this.sendRequest(SmbCommand.READ, body, true, true, true, false, false);
     const hdr = SmbPacket.parseHeader(resp);
     if (hdr.status !== SmbStatus.SUCCESS) {
+      hilog.info(DOMAIN, TAG, 'pipeRead failed status=0x%{public}x', hdr.status);
       throw new SmbError(hdr.status, '[CREATE] ' + SmbStatus.describe(hdr.status));
     }
-    return SmbPacket.parseReadResp(SmbPacket.body(resp));
+    const data = SmbPacket.parseReadResp(SmbPacket.body(resp));
+    hilog.info(DOMAIN, TAG, 'pipeRead ok len=%{public}d body=%{public}s', data.length, SmbPacket.body(resp).toString());
+    return data;
   }
 
   async enumerateShares(): Promise<ShareEntry[]> {
@@ -359,13 +359,18 @@ export class SmbClient {
     let pipeId: Uint8Array | undefined = undefined;
     try {
       await this.treeConnectTo('IPC$');
-      pipeId = await this.openPipe('\\srvsvc');
+      hilog.info(DOMAIN, TAG, 'enumerate: IPC$ ok treeId=%{public}s', this.treeId.toString());
+      pipeId = await this.openPipe('srvsvc');
+      hilog.info(DOMAIN, TAG, 'enumerate: pipe ok id=%{public}s', pipeId.toString());
       await this.pipeWriteRpc(pipeId, SmbPacket.rpcBindPdu(0));
+      hilog.info(DOMAIN, TAG, 'enumerate: bind written');
       const bindAck = await this.readRpcFrame(pipeId);
+      hilog.info(DOMAIN, TAG, 'enumerate: bind_ack len=%{public}d', bindAck.length);
       if (bindAck.length < 16 || bindAck[2] !== 0x0c) {
         throw new SmbError(-1, 'RPC bind 失败');
       }
-      await this.pipeWriteRpc(pipeId, SmbPacket.rpcNetShareEnumPdu(1));
+      await this.pipeWriteRpc(pipeId, SmbPacket.rpcNetShareEnumPdu(1, this.host));
+      hilog.info(DOMAIN, TAG, 'enumerate: enum written');
       let stub = new Uint8Array(0);
       let done = false;
       while (!done) {
@@ -400,10 +405,10 @@ export class SmbClient {
   private async readRpcFrame(pipeId: Uint8Array): Promise<Uint8Array> {
     let buf = new Uint8Array(0);
     while (true) {
-      if (buf.length >= 4) {
-        const len = (buf[1] << 16) | (buf[2] << 8) | buf[3];
-        if (buf.length >= 4 + len) {
-          const frame = buf.slice(4, 4 + len);
+      if (buf.length >= 16) {
+        const flen = SmbPacket.readU16(buf, 8);
+        if (buf.length >= flen) {
+          const frame = buf.slice(0, flen);
           return frame;
         }
       }
@@ -420,7 +425,7 @@ export class SmbClient {
     try {
       await socket.connect(host, port);
       const guid = await SmbCrypto.randomBytes(16);
-      const body = SmbPacket.negotiateReq(guid, false);
+      const body = SmbPacket.negotiateReq(guid, host);
       const raw = SmbPacket.build(SmbCommand.NEGOTIATE, 0, 0, 0, 0, 0xfeed, 0, body);
       const result: Promise<number> = new Promise<number>((resolve) => {
         const timer = setTimeout(() => {
@@ -460,8 +465,10 @@ export class SmbClient {
     const entries: QueryEntry[] = [];
     try {
       let done = false;
+      let first = true;
       while (!done) {
-        const body = SmbPacket.queryDirectoryReq(dir.fileId);
+        const body = SmbPacket.queryDirectoryReq(dir.fileId, first);
+        first = false;
         const resp = await this.sendRequest(SmbCommand.QUERY_DIRECTORY, body, true, true, true, false, false);
         const hdr = SmbPacket.parseHeader(resp);
         if (hdr.status === SmbStatus.NO_MORE_FILES) {
@@ -480,6 +487,28 @@ export class SmbClient {
       }
     } finally {
       await this.closeFile(dir.fileId);
+    }
+    const probes: QueryEntry[] = [];
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      if (e.name.indexOf('.') < 0) {
+        probes.push(e);
+      }
+    }
+    for (let i = 0; i < probes.length; i += 4) {
+      const group = probes.slice(i, i + 4);
+      await Promise.all(group.map(async (e: QueryEntry) => {
+        const full = relPath.length === 0 ? e.name : relPath + '\\' + e.name;
+        try {
+          const d = await this.create(full, true);
+          e.isDirectory = true;
+          e.size = d.endOfFile;
+          await this.closeFile(d.fileId);
+        } catch (err) {
+          e.isDirectory = false;
+          e.size = 0;
+        }
+      }));
     }
     return entries;
   }

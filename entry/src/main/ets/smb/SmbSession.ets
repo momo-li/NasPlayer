@@ -49,48 +49,20 @@ export class SmbSession {
 
   async connect(config: SmbConfig): Promise<void> {
     await this.disconnect();
-    try {
-      await this.connectWithLegacy(config.host, config.share, config.username, config.password,
-        config.domain, config.port, false);
-    } catch (e) {
-      if (SmbSession.shouldRetryLegacy(e)) {
-        hilog.warn(DOMAIN, TAG, 'connect failed, retry with SMB 2.1 dialect');
-        await this.connectWithLegacy(config.host, config.share, config.username, config.password,
-          config.domain, config.port, true);
-      } else {
-        throw e as Error;
-      }
-    }
+    await this.connectWithConfig(config.host, config.share, config.username, config.password,
+      config.domain, config.port);
   }
 
   async connectHost(host: string, username: string, password: string, domain: string,
     port: number): Promise<void> {
     await this.disconnect();
-    try {
-      await this.connectWithLegacy(host, 'IPC$', username, password, domain, port, false);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      const stack = e instanceof Error && e.stack !== undefined ? e.stack : '';
-      hilog.error(DOMAIN, TAG, 'connectHost first attempt failed: %{public}s stack=%{public}s', msg, stack);
-      if (SmbSession.shouldRetryLegacy(e)) {
-        hilog.warn(DOMAIN, TAG, 'connectHost failed, retry with SMB 2.1 dialect');
-        await this.connectWithLegacy(host, 'IPC$', username, password, domain, port, true);
-      } else {
-        throw e as Error;
-      }
-    }
+    await this.connectWithConfig(host, 'IPC$', username, password, domain, port);
   }
 
-  private static shouldRetryLegacy(e: Error): boolean {
-    const msg = e.message;
-    return msg.indexOf('断开') >= 0 || msg.indexOf('closed') >= 0 || msg.indexOf('超时') >= 0 ||
-      msg.indexOf('socket') >= 0 || msg.indexOf('服务器拒绝请求') >= 0;
-  }
-
-  private async connectWithLegacy(host: string, share: string, username: string, password: string,
-    domain: string, port: number, legacy: boolean): Promise<void> {
+  private async connectWithConfig(host: string, share: string, username: string, password: string,
+    domain: string, port: number): Promise<void> {
     const client = new SmbClient();
-    await client.connect(host, share, username, password, domain, port, legacy);
+    await client.connect(host, share, username, password, domain, port);
     this.client = client;
     const cfg: SmbConfig = {
       host: host,
@@ -119,6 +91,19 @@ export class SmbSession {
   }
 
   async readdir(relPath: string): Promise<VideoEntry[]> {
+    try {
+      return await this.readdirOnce(relPath);
+    } catch (e) {
+      if (SmbSession.isNetworkError(e) && this.config !== undefined) {
+        hilog.warn(DOMAIN, TAG, 'readdir network error, reconnect and retry');
+        await this.reconnect();
+        return await this.readdirOnce(relPath);
+      }
+      throw e as Error;
+    }
+  }
+
+  private async readdirOnce(relPath: string): Promise<VideoEntry[]> {
     if (this.client === undefined) {
       throw new Error('未连接');
     }
@@ -142,6 +127,19 @@ export class SmbSession {
   }
 
   async getSize(relPath: string): Promise<number> {
+    try {
+      return await this.getSizeOnce(relPath);
+    } catch (e) {
+      if (SmbSession.isNetworkError(e) && this.config !== undefined) {
+        hilog.warn(DOMAIN, TAG, 'getSize network error, reconnect and retry');
+        await this.reconnect();
+        return await this.getSizeOnce(relPath);
+      }
+      throw e as Error;
+    }
+  }
+
+  private async getSizeOnce(relPath: string): Promise<number> {
     if (this.client === undefined) {
       throw new Error('未连接');
     }
@@ -149,10 +147,38 @@ export class SmbSession {
   }
 
   async readRange(relPath: string, offset: number, length: number): Promise<Uint8Array> {
+    try {
+      return await this.readRangeOnce(relPath, offset, length);
+    } catch (e) {
+      if (SmbSession.isNetworkError(e) && this.config !== undefined) {
+        hilog.warn(DOMAIN, TAG, 'readRange network error, reconnect and retry');
+        await this.reconnect();
+        return await this.readRangeOnce(relPath, offset, length);
+      }
+      throw e as Error;
+    }
+  }
+
+  private async readRangeOnce(relPath: string, offset: number, length: number): Promise<Uint8Array> {
     if (this.client === undefined) {
       throw new Error('未连接');
     }
     return this.client.readRange(relPath, offset, length);
+  }
+
+  private static isNetworkError(e: Error): boolean {
+    const msg = e.message;
+    return msg.indexOf('Network') >= 0 || msg.indexOf('socket') >= 0 || msg.indexOf('closed') >= 0 ||
+      msg.indexOf('断开') >= 0 || msg.indexOf('connect') >= 0 || msg.indexOf('timeout') >= 0;
+  }
+
+  private async reconnect(): Promise<void> {
+    const cfg = this.config;
+    if (cfg === undefined) {
+      return;
+    }
+    await this.disconnect();
+    await this.connectWithConfig(cfg.host, cfg.share, cfg.username, cfg.password, cfg.domain, cfg.port);
   }
 
   async disconnect(): Promise<void> {

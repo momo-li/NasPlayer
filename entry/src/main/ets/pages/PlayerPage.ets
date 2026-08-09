@@ -1,6 +1,7 @@
 import { media } from '@kit.MediaKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { window } from '@kit.ArkUI';
+import { window, display } from '@kit.ArkUI';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { VideoEntry } from '../model/VideoEntry';
 import { PlayerParams } from '../model/RouteParams';
 import { StreamServer } from '../service/StreamServer';
@@ -15,7 +16,12 @@ export default struct PlayerPage {
   private switchInProgress: boolean = false;
   private hideTimer: number = -1;
   private dragging: boolean = false;
+  private startupDone: boolean = false;
+  private autoRetrying: boolean = false;
+  private isLandscape: boolean = false;
+  private resumePosition: number = 0;
 
+  @State videoFiles: VideoEntry[] = [];
   @State index: number = 0;
   @State playing: boolean = false;
   @State loading: boolean = false;
@@ -25,6 +31,19 @@ export default struct PlayerPage {
   @State duration: number = 0;
   @State controlsVisible: boolean = true;
   @State speedIdx: number = 1;
+  @State scaleIdx: number = 0;
+  @State xScale: number = 1;
+  @State yScale: number = 1;
+
+  private videoRatio: number = 0;
+  private screenWidth: number = 1280;
+  private screenHeight: number = 2832;
+  private scaleValues: media.VideoScaleType[] = [
+    media.VideoScaleType.VIDEO_SCALE_TYPE_SCALED_ASPECT,
+    media.VideoScaleType.VIDEO_SCALE_TYPE_SCALED_ASPECT,
+    media.VideoScaleType.VIDEO_SCALE_TYPE_FIT_CROP
+  ];
+  private scaleLabels: string[] = ['适应', '平铺', '裁剪'];
 
   private speedValues: media.PlaybackSpeed[] = [
     media.PlaybackSpeed.SPEED_FORWARD_0_75_X,
@@ -35,13 +54,36 @@ export default struct PlayerPage {
   ];
   private speedLabels: string[] = ['0.75x', '1.0x', '1.25x', '1.5x', '2.0x'];
 
-  private get files(): VideoEntry[] {
-    return this.params.files;
+  aboutToAppear(): void {
+    const p = this.params;
+    if (p !== undefined && p !== null && p.files !== undefined && p.files !== null && p.files.length > 0) {
+      this.videoFiles = p.files;
+      this.index = p.index;
+    }
+    try {
+      const d = display.getDefaultDisplaySync();
+      this.screenWidth = d.width;
+      this.screenHeight = d.height;
+    } catch (e) {
+      console.error('get display failed: ' + JSON.stringify(e));
+    }
   }
 
-  aboutToAppear(): void {
-    this.index = this.params.index;
-    this.enterLandscape();
+  private updateScale(): void {
+    const r = this.videoRatio;
+    if (this.scaleIdx !== 1 || r <= 0) {
+      this.xScale = 1;
+      this.yScale = 1;
+      return;
+    }
+    const screenR = this.screenWidth / this.screenHeight;
+    if (r >= screenR) {
+      this.xScale = 1;
+      this.yScale = r / screenR;
+    } else {
+      this.xScale = screenR / r;
+      this.yScale = 1;
+    }
   }
 
   aboutToDisappear(): void {
@@ -57,29 +99,13 @@ export default struct PlayerPage {
   }
 
   private async enterLandscape(): Promise<void> {
-    try {
-      const ctx = this.getUIContext().getHostContext();
-      if (ctx !== undefined) {
-        const win = await window.getLastWindow(ctx);
-        await win.setPreferredOrientation(window.Orientation.LANDSCAPE);
-        await win.setWindowSystemBarEnable([]);
-      }
-    } catch (e) {
-      console.error('enter landscape failed: ' + JSON.stringify(e));
-    }
   }
 
   private async exitLandscape(): Promise<void> {
-    try {
-      const ctx = this.getUIContext().getHostContext();
-      if (ctx !== undefined) {
-        const win = await window.getLastWindow(ctx);
-        await win.setPreferredOrientation(window.Orientation.PORTRAIT);
-        await win.setWindowSystemBarEnable(['status', 'navigation']);
-      }
-    } catch (e) {
-      console.error('exit landscape failed: ' + JSON.stringify(e));
-    }
+  }
+
+  private async toggleLandscape(): Promise<void> {
+    this.showControlsTemporarily();
   }
 
   private async cleanup(): Promise<void> {
@@ -97,7 +123,6 @@ export default struct PlayerPage {
       }
     }
     await StreamServer.getInstance().stop();
-    await this.exitLandscape();
   }
 
   private pauseIfPlaying(): void {
@@ -111,6 +136,7 @@ export default struct PlayerPage {
     player.on('stateChange', (state: media.AVPlayerState) => {
       if (state === 'playing') {
         this.playing = true;
+        this.errorMsg = '';
         this.showControlsTemporarily();
       } else if (state === 'paused') {
         this.playing = false;
@@ -129,15 +155,48 @@ export default struct PlayerPage {
     });
     player.on('error', (err: BusinessError) => {
       console.error('player error: ' + JSON.stringify(err));
-      this.loading = false;
-      this.errorMsg = '播放失败，请确认视频格式受支持';
+      if (!this.autoRetrying) {
+        this.loading = false;
+        this.errorMsg = '播放失败，请确认视频格式受支持';
+      }
     });
     player.on('endOfStream', () => {
       this.completed = true;
     });
+    player.on('videoSizeChange', (width: number, height: number) => {
+      if (width > 0 && height > 0) {
+        this.videoRatio = width / height;
+        this.updateScale();
+      }
+    });
   }
 
-  private async playEntry(entry: VideoEntry): Promise<void> {
+  private waitForState(player: media.AVPlayer, target: media.AVPlayerState, timeoutMs: number): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      if (player.state === target) {
+        resolve(true);
+        return;
+      }
+      const timer = setTimeout(() => {
+        player.off('stateChange', handler);
+        resolve(false);
+      }, timeoutMs);
+      const handler = (state: media.AVPlayerState): void => {
+        if (state === target) {
+          clearTimeout(timer);
+          player.off('stateChange', handler);
+          resolve(true);
+        } else if (state === 'error') {
+          clearTimeout(timer);
+          player.off('stateChange', handler);
+          resolve(false);
+        }
+      };
+      player.on('stateChange', handler);
+    });
+  }
+
+  private async playEntry(entry: VideoEntry, retried: boolean = false): Promise<void> {
     this.loading = true;
     this.errorMsg = '';
     this.completed = false;
@@ -150,22 +209,64 @@ export default struct PlayerPage {
         player = await media.createAVPlayer();
         this.attachEvents(player);
         this.avPlayer = player;
-        if (this.surfaceId.length > 0) {
-          player.surfaceId = this.surfaceId;
-        }
       } else {
         await player.reset();
       }
+      if (this.surfaceId.length === 0) {
+        throw new Error('视频 surface 未就绪');
+      }
       player.url = StreamServer.getInstance().urlFor(entry.path);
+      const ready = await this.waitForState(player, 'initialized', 15000);
+      if (!ready) {
+        throw new Error('视频源加载超时');
+      }
+      player.surfaceId = this.surfaceId;
       await player.prepare();
+      try {
+        player.videoScaleType = this.scaleValues[this.scaleIdx];
+      } catch (e) {
+        console.error('set scale failed: ' + JSON.stringify(e));
+      }
+      this.updateScale();
       this.duration = player.duration;
+      if (this.resumePosition > 0) {
+        try {
+          player.seek(this.resumePosition);
+        } catch (e) {
+          console.error('seek failed: ' + JSON.stringify(e));
+        }
+        this.resumePosition = 0;
+      }
       if (this.speedIdx !== 1) {
         player.setSpeed(this.speedValues[this.speedIdx]);
       }
       await player.play();
+      this.autoRetrying = false;
+      this.errorMsg = '';
       this.loading = false;
     } catch (e) {
       console.error('play failed: ' + JSON.stringify(e));
+      if (!retried) {
+        hilog.info(0x0000, 'NasPlayer', 'play failed, auto retry once');
+        this.autoRetrying = true;
+        try {
+          const old = this.avPlayer;
+          this.avPlayer = undefined;
+          if (old !== undefined) {
+            await old.release();
+          }
+        } catch (e2) {
+          console.error('release old player failed: ' + JSON.stringify(e2));
+        }
+        await new Promise<void>((r) => {
+          setTimeout(() => {
+            r();
+          }, 500);
+        });
+        await this.playEntry(entry, true);
+        return;
+      }
+      this.autoRetrying = false;
       this.loading = false;
       this.errorMsg = '播放失败，请确认视频格式受支持';
     }
@@ -197,6 +298,16 @@ export default struct PlayerPage {
     this.showControlsTemporarily();
   }
 
+  private cycleScale(): void {
+    this.scaleIdx = (this.scaleIdx + 1) % this.scaleValues.length;
+    const p = this.avPlayer;
+    if (p !== undefined) {
+      p.videoScaleType = this.scaleValues[this.scaleIdx];
+    }
+    this.updateScale();
+    this.showControlsTemporarily();
+  }
+
   private async switchTo(delta: number): Promise<void> {
     if (this.switchInProgress) {
       return;
@@ -206,14 +317,14 @@ export default struct PlayerPage {
       this.showToast('已经是第一部视频');
       return;
     }
-    if (next >= this.files.length) {
+    if (next >= this.videoFiles.length) {
       this.showToast('已经是最后一部视频');
       return;
     }
     this.switchInProgress = true;
     try {
       this.index = next;
-      await this.playEntry(this.files[next]);
+      await this.playEntry(this.videoFiles[next]);
     } finally {
       this.switchInProgress = false;
     }
@@ -269,10 +380,17 @@ export default struct PlayerPage {
         XComponent({ id: 'playerSurface', type: XComponentType.SURFACE, controller: this.xController })
           .width('100%')
           .height('100%')
+          .scale({ x: this.xScale, y: this.yScale })
           .onLoad(() => {
-            this.surfaceId = this.xController.getXComponentSurfaceId();
-            if (this.index >= 0 && this.index < this.files.length) {
-              this.playEntry(this.files[this.index]);
+            const newId = this.xController.getXComponentSurfaceId();
+            hilog.info(0x0000, 'NasPlayer', 'xcomp onLoad surfaceId=%{public}s startup=%{public}s', newId, String(this.startupDone));
+            if (newId === this.surfaceId && this.startupDone) {
+              return;
+            }
+            this.surfaceId = newId;
+            this.startupDone = true;
+            if (this.index >= 0 && this.index < this.videoFiles.length) {
+              this.playEntry(this.videoFiles[this.index]);
             }
           })
 
@@ -300,7 +418,7 @@ export default struct PlayerPage {
               .height(38)
               .onClick(() => {
                 this.errorMsg = '';
-                this.playEntry(this.files[this.index]);
+                this.playEntry(this.videoFiles[this.index]);
               })
           }
         }
@@ -323,7 +441,8 @@ export default struct PlayerPage {
         if (this.controlsVisible && this.errorMsg.length === 0) {
           Column() {
             Row({ space: 10 }) {
-              Text(this.index >= 0 && this.index < this.files.length ? this.files[this.index].name : '')
+              Text(this.index >= 0 && this.videoFiles.length > 0 && this.index < this.videoFiles.length ?
+                this.videoFiles[this.index].name : '')
                 .fontSize(15)
                 .fontColor(Color.White)
                 .maxLines(1)
@@ -337,6 +456,15 @@ export default struct PlayerPage {
                 .borderRadius(12)
                 .onClick(() => {
                   this.cycleSpeed();
+                })
+              Text(this.scaleLabels[this.scaleIdx])
+                .fontSize(13)
+                .fontColor(Color.White)
+                .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+                .backgroundColor($r('app.color.player_overlay'))
+                .borderRadius(12)
+                .onClick(() => {
+                  this.cycleScale();
                 })
             }
             .width('100%')

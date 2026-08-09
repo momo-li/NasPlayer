@@ -32,7 +32,21 @@ struct Index {
   aboutToAppear(): void {
     ThumbnailService.getInstance().init(this.getUIContext().getHostContext() as common.UIAbilityContext);
     this.loadCredentials();
-    this.startScan();
+    this.loadCachedHosts();
+  }
+
+  async loadCachedHosts(): Promise<void> {
+    try {
+      const cached = await ConfigStore.loadHosts(this.getUIContext().getHostContext() as common.UIAbilityContext);
+      this.hosts = cached;
+      if (cached.length > 0) {
+        this.progressText = '上次扫描到 ' + cached.length + ' 台主机（点击扫描可更新）';
+      } else {
+        this.startScan();
+      }
+    } catch (e) {
+      this.startScan();
+    }
   }
 
   async loadCredentials(): Promise<void> {
@@ -62,6 +76,7 @@ struct Index {
       });
       this.hosts = found;
       this.progressText = found.length > 0 ? '发现 ' + found.length + ' 台 SMB 主机' : '未发现 SMB 主机';
+      await ConfigStore.saveHosts(this.getUIContext().getHostContext() as common.UIAbilityContext, found);
     } catch (e) {
       this.errorText = '扫描失败';
       this.progressText = '';

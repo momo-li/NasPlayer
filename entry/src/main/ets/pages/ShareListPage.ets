@@ -1,6 +1,8 @@
 import { ShareEntry } from '../model/ShareEntry';
 import { BrowserParams, SharesParams } from '../model/RouteParams';
 import { SmbService } from '../service/SmbService';
+import { ConfigStore } from '../service/ConfigStore';
+import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
 @Component
@@ -10,6 +12,7 @@ export default struct ShareListPage {
   @State shares: ShareEntry[] = [];
   @State loading: boolean = false;
   @State errorText: string = '';
+  @State fromCache: boolean = false;
 
   aboutToAppear(): void {
     this.load();
@@ -19,12 +22,42 @@ export default struct ShareListPage {
     this.getUIContext().getPromptAction().showToast({ message: msg });
   }
 
-  async load(): Promise<void> {
+  private filterShares(list: ShareEntry[]): ShareEntry[] {
+    const out: ShareEntry[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const s = list[i];
+      if (s.isIpc) {
+        continue;
+      }
+      if (s.name.endsWith('$')) {
+        continue;
+      }
+      out.push(s);
+    }
+    return out;
+  }
+
+  async load(force: boolean = false): Promise<void> {
     this.loading = true;
     this.errorText = '';
     try {
-      const list = await SmbService.getInstance().enumerateShares();
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      if (!force) {
+        const cached = await ConfigStore.loadShares(ctx, this.params.host);
+        if (cached.length > 0) {
+          this.shares = this.filterShares(cached);
+          this.fromCache = true;
+          this.loading = false;
+          return;
+        }
+      }
+      const raw = await SmbService.getInstance().enumerateShares();
+      const list = this.filterShares(raw);
       this.shares = list;
+      this.fromCache = false;
+      if (list.length > 0) {
+        await ConfigStore.saveShares(ctx, this.params.host, list);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const stack = e instanceof Error && e.stack !== undefined ? e.stack : '';
@@ -111,36 +144,63 @@ export default struct ShareListPage {
               .height(36)
               .backgroundColor($r('app.color.theme_primary'))
               .onClick(() => {
-                this.load();
+                this.load(true);
               })
           }
           .width('100%')
           .height('100%')
           .justifyContent(FlexAlign.Center)
         } else if (this.shares.length === 0) {
-          Column() {
+          Column({ space: 10 }) {
             Text('该主机没有可用的共享')
               .fontSize(14)
               .fontColor($r('app.color.text_secondary'))
+            Button('刷新')
+              .fontSize(14)
+              .height(36)
+              .backgroundColor($r('app.color.theme_primary'))
+              .onClick(() => {
+                this.load(true);
+              })
           }
           .width('100%')
           .height('100%')
           .justifyContent(FlexAlign.Center)
         } else {
-          List({ space: 8 }) {
-            ForEach(this.shares, (entry: ShareEntry) => {
-              ListItem() {
-                this.ShareCell(entry)
-              }
-              .onClick(() => {
-                this.openShare(entry);
-              })
-            }, (entry: ShareEntry) => entry.name)
+          Column() {
+            Row() {
+              Text(this.fromCache ? '上次扫描的共享（点击刷新获取最新）' : '共享列表')
+                .fontSize(12)
+                .fontColor($r('app.color.text_secondary'))
+                .layoutWeight(1)
+              Button('刷新')
+                .fontSize(12)
+                .height(28)
+                .padding({ left: 10, right: 10 })
+                .backgroundColor($r('app.color.theme_primary'))
+                .onClick(() => {
+                  this.load(true);
+                })
+            }
+            .width('100%')
+            .padding({ left: 14, right: 14, bottom: 6 })
+            List({ space: 8 }) {
+              ForEach(this.shares, (entry: ShareEntry) => {
+                ListItem() {
+                  this.ShareCell(entry)
+                }
+                .onClick(() => {
+                  this.openShare(entry);
+                })
+              }, (entry: ShareEntry) => entry.name)
+            }
+            .width('100%')
+            .layoutWeight(1)
+            .padding({ left: 14, right: 14, bottom: 14 })
+            .scrollBar(BarState.Off)
           }
           .width('100%')
-          .layoutWeight(1)
-          .padding({ left: 14, right: 14, bottom: 14 })
-          .scrollBar(BarState.Off)
+          .height('100%')
         }
       }
       .width('100%')

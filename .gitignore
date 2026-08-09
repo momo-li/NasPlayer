@@ -10,3 +10,7 @@
 /.clang-tidy
 **/.test
 /.appanalyzer
+/.deveco/
+/.cache/
+
+
