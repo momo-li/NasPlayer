@@ -29,7 +29,7 @@ export class SmbSocket {
     const tcp = socket.constructTCPSocketInstance();
     this.tcp = tcp;
     const addr: socket.NetAddress = { address: host, port: port, family: 1 };
-    const opts: socket.TCPConnectOptions = { address: addr, timeout: 10000 };
+    const opts: socket.TCPConnectOptions = { address: addr, timeout: 4000 };
     try {
       await tcp.connect(opts);
     } catch (e) {

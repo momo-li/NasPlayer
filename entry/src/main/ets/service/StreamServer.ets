@@ -98,8 +98,25 @@ export class StreamServer {
         }
       }
       this.sizeCache.clear();
+      // 等待 NETSTACK 释放旧 accept 循环，避免 accept fail (errno 22)
+      await new Promise<void>((r) => {
+        setTimeout(() => {
+          r();
+        }, 500);
+      });
     }
     await this.start();
+  }
+
+  /** 预热：确保 SMB 连接就绪并缓存文件大小，让 AVPlayer 请求到达时能立即响应 */
+  async warmup(relPath: string): Promise<number> {
+    const cached = this.sizeCache.get(relPath);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const size = await SmbService.getInstance().getSize(relPath);
+    this.sizeCache.set(relPath, size);
+    return size;
   }
 
   async stop(): Promise<void> {

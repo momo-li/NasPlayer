@@ -60,6 +60,8 @@ export default struct PlayerPage {
       this.videoFiles = p.files;
       this.index = p.index;
     }
+    // 进入播放页即全屏：隐藏状态栏/导航栏，让视频 surface 覆盖整个屏幕
+    this.enterFullscreen();
   }
 
   private updateScale(): void {
@@ -81,18 +83,21 @@ export default struct PlayerPage {
   aboutToDisappear(): void {
     hilog.info(0x0000, 'NasPlayer', 'player aboutToDisappear');
     this.exitLandscape();
+    this.exitFullscreen();
     this.cleanup();
   }
 
   onPageHide(): void {
     hilog.info(0x0000, 'NasPlayer', 'player onPageHide');
     this.exitLandscape();
+    this.exitFullscreen();
     this.pauseIfPlaying();
   }
 
   private onWillDisappear(): void {
     hilog.info(0x0000, 'NasPlayer', 'player onWillDisappear');
     this.exitLandscape();
+    this.exitFullscreen();
     this.cleanup();
   }
 
@@ -132,13 +137,34 @@ export default struct PlayerPage {
     }
   }
 
+  /** 全屏沉浸：隐藏状态栏/导航栏 + 全屏布局，视频 surface 覆盖整个屏幕 */
+  private enterFullscreen(): void {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const win = ctx.windowStage.getMainWindowSync();
+      win.setWindowLayoutFullScreen(true);
+      win.setWindowSystemBarEnable([]);
+    } catch (e) {
+      console.error('enter fullscreen failed: ' + JSON.stringify(e));
+    }
+  }
+
+  /** 退出全屏：恢复状态栏/导航栏显示，恢复正常布局 */
+  private exitFullscreen(): void {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const win = ctx.windowStage.getMainWindowSync();
+      win.setWindowLayoutFullScreen(false);
+      win.setWindowSystemBarEnable(['status', 'navigation']);
+    } catch (e) {
+      console.error('exit fullscreen failed: ' + JSON.stringify(e));
+    }
+  }
+
   private async enterLandscape(): Promise<void> {
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const win = ctx.windowStage.getMainWindowSync();
-      // 横屏：隐藏状态栏/导航栏 + 全屏布局，让视频 surface 覆盖整个屏幕
-      win.setWindowLayoutFullScreen(true);
-      win.setWindowSystemBarEnable([]);
       win.setPreferredOrientation(window.Orientation.LANDSCAPE);
       this.isLandscape = true;
       this.updateScale();
@@ -152,9 +178,6 @@ export default struct PlayerPage {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const win = ctx.windowStage.getMainWindowSync();
       win.setPreferredOrientation(window.Orientation.PORTRAIT);
-      // 恢复状态栏/导航栏显示，恢复正常布局
-      win.setWindowLayoutFullScreen(false);
-      win.setWindowSystemBarEnable(['status', 'navigation']);
       this.isLandscape = false;
       this.updateScale();
     } catch (e) {
@@ -230,8 +253,11 @@ export default struct PlayerPage {
     });
     player.on('error', (err: BusinessError) => {
       console.error('player error: ' + JSON.stringify(err));
-      this.loading = false;
-      this.errorMsg = PlayerPage.describePlayerError(err, StreamServer.getInstance().getLastServeError());
+      // 加载/准备期间出错由 playEntry catch 统一提示，这里避免重复弹提示
+      if (!this.loading) {
+        this.loading = false;
+        this.errorMsg = PlayerPage.describePlayerError(err, StreamServer.getInstance().getLastServeError());
+      }
     });
     player.on('endOfStream', () => {
       this.completed = true;
@@ -271,7 +297,7 @@ export default struct PlayerPage {
     });
   }
 
-  private async playEntry(entry: VideoEntry): Promise<void> {
+  private async playEntry(entry: VideoEntry, retryCount: number = 0): Promise<void> {
     hilog.info(0x0000, 'NasPlayer', 'playEntry start, destroyed=%{public}s, surface=%{public}s',
       String(this.destroyed), this.surfaceId);
     if (this.destroyed) {
@@ -283,7 +309,7 @@ export default struct PlayerPage {
     this.currentTime = 0;
     this.duration = 0;
     try {
-      await StreamServer.getInstance().restart();
+      await StreamServer.getInstance().start();
       hilog.info(0x0000, 'NasPlayer', 'playEntry: stream server started, port=%{public}d',
         StreamServer.getInstance().getPort());
       let player = this.avPlayer;
@@ -299,17 +325,21 @@ export default struct PlayerPage {
       if (this.surfaceId.length === 0) {
         throw new Error('视频 surface 未就绪');
       }
+      // 预热：提前确保 SMB 连接就绪并缓存文件大小，避免 AVPlayer 请求时等太久。
+      // 预热失败直接抛出，快速进入重试，避免在 AVPlayer 阶段白等
+      await this.withTimeout(StreamServer.getInstance().warmup(entry.path), 6000, '视频信息加载');
       const url = StreamServer.getInstance().urlFor(entry.path);
       player.url = url;
       hilog.info(0x0000, 'NasPlayer', 'playEntry: url set, state=%{public}s', player.state);
-      const ready = await this.waitForState(player, 'initialized', 15000);
+      const ready = await this.waitForState(player, 'initialized', 8000);
       hilog.info(0x0000, 'NasPlayer', 'playEntry: wait initialized ready=%{public}s state=%{public}s',
         String(ready), player.state);
       if (!ready) {
         throw new Error('视频源加载超时');
       }
       player.surfaceId = this.surfaceId;
-      await player.prepare();
+      // prepare 加超时保护：网络瞬断（如 USB 连接导致 Wi-Fi 闪断）时避免无限卡加载
+      await this.prepareWithTimeout(player, 10000);
       hilog.info(0x0000, 'NasPlayer', 'playEntry: prepared, state=%{public}s', player.state);
       this.updateScale();
       this.duration = player.duration;
@@ -332,9 +362,72 @@ export default struct PlayerPage {
     } catch (e) {
       console.error('play failed: ' + JSON.stringify(e));
       hilog.error(0x0000, 'NasPlayer', 'playEntry failed: %{public}s', JSON.stringify(e));
+      // 网络类失败：静默自动重试（保持加载中，不弹提示），最多 2 次
+      if (retryCount < 2 && PlayerPage.isNetworkish(e, StreamServer.getInstance().getLastServeError())) {
+        hilog.info(0x0000, 'NasPlayer', 'playEntry network issue, silent retry %{public}d/2', retryCount + 1);
+        // 重试前重建播放器，避免残留状态
+        try {
+          const old = this.avPlayer;
+          this.avPlayer = undefined;
+          if (old !== undefined) {
+            await old.release();
+          }
+        } catch (e2) {
+          console.error('release old player failed: ' + JSON.stringify(e2));
+        }
+        await new Promise<void>((r) => {
+          setTimeout(() => {
+            r();
+          }, 500);
+        });
+        await this.playEntry(entry, retryCount + 1);
+        return;
+      }
       this.loading = false;
       this.errorMsg = PlayerPage.describePlayFailure(e, StreamServer.getInstance().getLastServeError());
     }
+  }
+
+  private static isNetworkish(e: Object, serveErr: string): boolean {
+    const detail = JSON.stringify(e);
+    if (serveErr.length > 0 &&
+      (serveErr.indexOf('2303200') >= 0 || serveErr.indexOf('Network') >= 0 ||
+        serveErr.indexOf('closed') >= 0 || serveErr.indexOf('超时') >= 0)) {
+      return true;
+    }
+    return detail.indexOf('超时') >= 0 || detail.indexOf('Network') >= 0 ||
+      detail.indexOf('closed') >= 0 || detail.indexOf('socket') >= 0 ||
+      detail.indexOf('5400102') >= 0 || detail.indexOf('5400103') >= 0;
+  }
+
+  private prepareWithTimeout(player: media.AVPlayer, timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error('视频准备超时'));
+      }, timeoutMs);
+      player.prepare().then(() => {
+        clearTimeout(timer);
+        resolve();
+      }).catch((e: Error) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+    });
+  }
+
+  private withTimeout<T>(promise: Promise<T>, timeoutMs: number, what: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(what + '超时'));
+      }, timeoutMs);
+      promise.then((v: T) => {
+        clearTimeout(timer);
+        resolve(v);
+      }).catch((e: Error) => {
+        clearTimeout(timer);
+        reject(e);
+      });
+    });
   }
 
   private static describePlayFailure(e: Object, serveErr: string): string {
@@ -725,6 +818,7 @@ export default struct PlayerPage {
     })
     .onHidden(() => {
       this.exitLandscape();
+      this.exitFullscreen();
       this.pauseIfPlaying();
     })
   }
