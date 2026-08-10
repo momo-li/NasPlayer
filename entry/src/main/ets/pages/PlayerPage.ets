@@ -38,6 +38,10 @@ export default struct PlayerPage {
   @State yScale: number = 1;
   @State screenBrightness: number = 0.8;
   @State brightnessPanel: boolean = false;
+  // 挖孔/刘海安全区避让高度（vp）
+  @State topSafeHeight: number = 0;
+  @State bottomSafeHeight: number = 0;
+  private safeAreaListening: boolean = false;
 
   private scaleValues: media.VideoScaleType[] = [
     media.VideoScaleType.VIDEO_SCALE_TYPE_SCALED_ASPECT,
@@ -60,8 +64,8 @@ export default struct PlayerPage {
       this.videoFiles = p.files;
       this.index = p.index;
     }
-    // 进入播放页即全屏：隐藏状态栏/导航栏，让视频 surface 覆盖整个屏幕
-    this.enterFullscreen();
+    // 根据当前状态决定全屏/显示系统栏
+    this.applyFullscreenState();
   }
 
   private updateScale(): void {
@@ -137,15 +141,80 @@ export default struct PlayerPage {
     }
   }
 
-  /** 全屏沉浸：隐藏状态栏/导航栏 + 全屏布局，视频 surface 覆盖整个屏幕 */
-  private enterFullscreen(): void {
+  /** 根据状态决定全屏/显示系统栏：裁剪模式或横屏时全屏，适应模式竖屏时显示系统栏 */
+  private applyFullscreenState(): void {
+    const needFullscreen: boolean = this.isLandscape || this.scaleIdx === 1;
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const win = ctx.windowStage.getMainWindowSync();
-      win.setWindowLayoutFullScreen(true);
-      win.setWindowSystemBarEnable([]);
+      if (needFullscreen) {
+        win.setWindowLayoutFullScreen(true);
+        win.setWindowSystemBarEnable([]);
+        // 全屏布局异步生效，延迟读取避让区确保拿到真实值
+        this.updateSafeArea(win);
+        setTimeout(() => {
+          this.updateSafeArea(win);
+        }, 500);
+        if (!this.safeAreaListening) {
+          this.safeAreaListening = true;
+          win.on('avoidAreaChange', (data) => {
+            if (data.type === window.AvoidAreaType.TYPE_SYSTEM ||
+              data.type === window.AvoidAreaType.TYPE_CUTOUT ||
+              data.type === window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR) {
+              this.updateSafeArea(win);
+            }
+          });
+        }
+      } else {
+        // 竖屏适应模式：显示状态栏/导航栏，正常布局
+        if (this.safeAreaListening) {
+          this.safeAreaListening = false;
+          win.off('avoidAreaChange');
+        }
+        this.topSafeHeight = 0;
+        this.bottomSafeHeight = 0;
+        win.setWindowLayoutFullScreen(false);
+        win.setWindowSystemBarEnable(['status', 'navigation']);
+      }
     } catch (e) {
-      console.error('enter fullscreen failed: ' + JSON.stringify(e));
+      console.error('apply fullscreen state failed: ' + JSON.stringify(e));
+    }
+  }
+
+  /** 读取系统避让区（挖孔/刘海/手势条），换算为 vp 供 UI padding 使用 */
+  private updateSafeArea(win: window.Window): void {
+    try {
+      const ui = this.getUIContext();
+      let top = 0;
+      let bottom = 0;
+      // 挖孔/刘海区域（前置摄像头）——全屏时状态栏隐藏，TYPE_SYSTEM 可能为 0，必须用 TYPE_CUTOUT
+      try {
+        const cutout = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_CUTOUT);
+        top = Math.max(top, cutout.topRect.height);
+      } catch (e) {
+        console.error('get cutout area failed: ' + JSON.stringify(e));
+      }
+      // 系统避让区（状态栏兜底）
+      try {
+        const sys = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+        top = Math.max(top, sys.topRect.height);
+        bottom = Math.max(bottom, sys.bottomRect.height);
+      } catch (e) {
+        console.error('get system area failed: ' + JSON.stringify(e));
+      }
+      // 底部导航指示条
+      try {
+        const nav = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR);
+        bottom = Math.max(bottom, nav.bottomRect.height);
+      } catch (e) {
+        console.error('get nav indicator failed: ' + JSON.stringify(e));
+      }
+      this.topSafeHeight = ui.px2vp(top);
+      this.bottomSafeHeight = ui.px2vp(bottom);
+      hilog.info(0x0000, 'NasPlayer', 'safe area updated top=%{public}d bottom=%{public}d',
+        top, bottom);
+    } catch (e) {
+      console.error('update safe area failed: ' + JSON.stringify(e));
     }
   }
 
@@ -154,6 +223,10 @@ export default struct PlayerPage {
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const win = ctx.windowStage.getMainWindowSync();
+      if (this.safeAreaListening) {
+        this.safeAreaListening = false;
+        win.off('avoidAreaChange');
+      }
       win.setWindowLayoutFullScreen(false);
       win.setWindowSystemBarEnable(['status', 'navigation']);
     } catch (e) {
@@ -168,6 +241,7 @@ export default struct PlayerPage {
       win.setPreferredOrientation(window.Orientation.LANDSCAPE);
       this.isLandscape = true;
       this.updateScale();
+      this.applyFullscreenState();
     } catch (e) {
       console.error('enter landscape failed: ' + JSON.stringify(e));
     }
@@ -180,6 +254,7 @@ export default struct PlayerPage {
       win.setPreferredOrientation(window.Orientation.PORTRAIT);
       this.isLandscape = false;
       this.updateScale();
+      this.applyFullscreenState();
     } catch (e) {
       console.error('exit landscape failed: ' + JSON.stringify(e));
     }
@@ -528,6 +603,7 @@ export default struct PlayerPage {
   private cycleScale(): void {
     this.scaleIdx = (this.scaleIdx + 1) % this.scaleValues.length;
     this.updateScale();
+    this.applyFullscreenState();
     this.showControlsTemporarily();
   }
 
@@ -715,7 +791,7 @@ export default struct PlayerPage {
                 .layoutWeight(1)
             }
             .width('100%')
-            .padding({ left: 16, right: 16, top: 14 })
+            .padding({ left: 16, right: 16, top: this.topSafeHeight + 14 })
 
             Blank()
 
@@ -785,7 +861,7 @@ export default struct PlayerPage {
                 })
             }
             .width('100%')
-            .padding({ left: 16, right: 16, top: 10, bottom: 18 })
+            .padding({ left: 16, right: 16, top: 10, bottom: this.bottomSafeHeight + 18 })
           }
           .width('100%')
           .height('100%')
