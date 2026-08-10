@@ -39,15 +39,11 @@ export default struct PlayerPage {
   @State screenBrightness: number = 0.8;
   @State brightnessPanel: boolean = false;
 
-  private videoRatio: number = 0;
-  private screenWidth: number = 1280;
-  private screenHeight: number = 2832;
   private scaleValues: media.VideoScaleType[] = [
-    media.VideoScaleType.VIDEO_SCALE_TYPE_SCALED_ASPECT,
     media.VideoScaleType.VIDEO_SCALE_TYPE_SCALED_ASPECT,
     media.VideoScaleType.VIDEO_SCALE_TYPE_FIT_CROP
   ];
-  private scaleLabels: string[] = ['适应', '平铺', '裁剪'];
+  private scaleLabels: string[] = ['适应', '裁剪'];
 
   private speedValues: media.PlaybackSpeed[] = [
     media.PlaybackSpeed.SPEED_FORWARD_0_75_X,
@@ -64,29 +60,21 @@ export default struct PlayerPage {
       this.videoFiles = p.files;
       this.index = p.index;
     }
-    try {
-      const d = display.getDefaultDisplaySync();
-      this.screenWidth = d.width;
-      this.screenHeight = d.height;
-    } catch (e) {
-      console.error('get display failed: ' + JSON.stringify(e));
-    }
   }
 
   private updateScale(): void {
-    const r = this.videoRatio;
-    if (this.scaleIdx !== 1 || r <= 0) {
-      this.xScale = 1;
-      this.yScale = 1;
+    const p = this.avPlayer;
+    this.xScale = 1;
+    this.yScale = 1;
+    if (p === undefined) {
       return;
     }
-    const screenR = this.screenWidth / this.screenHeight;
-    if (r >= screenR) {
-      this.xScale = 1;
-      this.yScale = r / screenR;
-    } else {
-      this.xScale = screenR / r;
-      this.yScale = 1;
+    // 横竖屏统一遵循用户选择的缩放模式（适应/裁剪）
+    const type: media.VideoScaleType = this.scaleValues[this.scaleIdx];
+    try {
+      p.videoScaleType = type;
+    } catch (e) {
+      console.error('set scale failed: ' + JSON.stringify(e));
     }
   }
 
@@ -148,8 +136,12 @@ export default struct PlayerPage {
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const win = ctx.windowStage.getMainWindowSync();
+      // 横屏：隐藏状态栏/导航栏 + 全屏布局，让视频 surface 覆盖整个屏幕
+      win.setWindowLayoutFullScreen(true);
+      win.setWindowSystemBarEnable([]);
       win.setPreferredOrientation(window.Orientation.LANDSCAPE);
       this.isLandscape = true;
+      this.updateScale();
     } catch (e) {
       console.error('enter landscape failed: ' + JSON.stringify(e));
     }
@@ -160,7 +152,11 @@ export default struct PlayerPage {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const win = ctx.windowStage.getMainWindowSync();
       win.setPreferredOrientation(window.Orientation.PORTRAIT);
+      // 恢复状态栏/导航栏显示，恢复正常布局
+      win.setWindowLayoutFullScreen(false);
+      win.setWindowSystemBarEnable(['status', 'navigation']);
       this.isLandscape = false;
+      this.updateScale();
     } catch (e) {
       console.error('exit landscape failed: ' + JSON.stringify(e));
     }
@@ -242,7 +238,6 @@ export default struct PlayerPage {
     });
     player.on('videoSizeChange', (width: number, height: number) => {
       if (width > 0 && height > 0) {
-        this.videoRatio = width / height;
         this.updateScale();
       }
     });
@@ -316,11 +311,6 @@ export default struct PlayerPage {
       player.surfaceId = this.surfaceId;
       await player.prepare();
       hilog.info(0x0000, 'NasPlayer', 'playEntry: prepared, state=%{public}s', player.state);
-      try {
-        player.videoScaleType = this.scaleValues[this.scaleIdx];
-      } catch (e) {
-        console.error('set scale failed: ' + JSON.stringify(e));
-      }
       this.updateScale();
       this.duration = player.duration;
       if (this.resumePosition > 0) {
@@ -444,10 +434,6 @@ export default struct PlayerPage {
 
   private cycleScale(): void {
     this.scaleIdx = (this.scaleIdx + 1) % this.scaleValues.length;
-    const p = this.avPlayer;
-    if (p !== undefined) {
-      p.videoScaleType = this.scaleValues[this.scaleIdx];
-    }
     this.updateScale();
     this.showControlsTemporarily();
   }
@@ -525,6 +511,7 @@ export default struct PlayerPage {
           .width('100%')
           .height('100%')
           .scale({ x: this.xScale, y: this.yScale })
+          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
           .onLoad(() => {
             const newId = this.xController.getXComponentSurfaceId();
             hilog.info(0x0000, 'NasPlayer', 'xcomp onLoad surfaceId=%{public}s startup=%{public}s', newId, String(this.startupDone));
