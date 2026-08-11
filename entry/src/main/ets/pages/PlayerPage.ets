@@ -22,6 +22,7 @@ export default struct PlayerPage {
   private destroyed: boolean = false;
   @State isLandscape: boolean = false;
   private resumePosition: number = 0;
+  @State holdX2Tip: boolean = false;
 
   @State videoFiles: VideoEntry[] = [];
   @State index: number = 0;
@@ -673,6 +674,53 @@ export default struct PlayerPage {
     this.showControlsTemporarily();
   }
 
+  /** 快进/快退：目标位置夹在 [0, duration]，更新进度并提示 */
+  private async seekBy(deltaMs: number, showToast: boolean): Promise<void> {
+    const p = this.avPlayer;
+    if (p === undefined || this.duration <= 0) {
+      return;
+    }
+    const target = Math.min(Math.max(this.currentTime + deltaMs, 0), this.duration);
+    this.currentTime = target;
+    try {
+      p.seek(target);
+    } catch (e) {
+      console.error('seek by failed: ' + JSON.stringify(e));
+    }
+    this.showControlsTemporarily();
+    if (showToast) {
+      this.showToast((deltaMs >= 0 ? '+' : '') + (deltaMs / 1000) + 's');
+    }
+  }
+
+  /** 长按半屏：X2 倍速播放（替代高频 seek，避免卡顿）。AVPlayer 不支持倒放，左右统一 X2 倍速 */
+  private startHoldSeek(): void {
+    const p = this.avPlayer;
+    if (p === undefined || p.state !== 'playing') {
+      return;
+    }
+    this.holdX2Tip = true;
+    this.showControlsTemporarily();
+    try {
+      p.setSpeed(media.PlaybackSpeed.SPEED_FORWARD_2_00_X);
+    } catch (e) {
+      console.error('set x2 speed failed: ' + JSON.stringify(e));
+    }
+  }
+
+  private stopHoldSeek(): void {
+    this.holdX2Tip = false;
+    const p = this.avPlayer;
+    if (p !== undefined && p.state === 'playing') {
+      try {
+        p.setSpeed(this.speedValues[this.speedIdx]);
+      } catch (e) {
+        console.error('restore speed failed: ' + JSON.stringify(e));
+      }
+    }
+    this.showControlsTemporarily();
+  }
+
   build() {
     NavDestination() {
       Stack({ alignContent: Alignment.Center }) {
@@ -779,6 +827,13 @@ export default struct PlayerPage {
           })
         }
 
+        if (this.holdX2Tip) {
+          Text('X2')
+            .fontSize(26)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(Color.White)
+        }
+
         if (this.controlsVisible && this.errorMsg.length === 0) {
           Column() {
             Row({ space: 10 }) {
@@ -883,6 +938,21 @@ export default struct PlayerPage {
           PanGesture({ direction: PanDirection.Down, distance: 30 })
             .onActionEnd(() => {
               this.switchTo(-1);
+            }),
+          PanGesture({ direction: PanDirection.Right, distance: 30 })
+            .onActionEnd(() => {
+              this.seekBy(10000, true);
+            }),
+          PanGesture({ direction: PanDirection.Left, distance: 30 })
+            .onActionEnd(() => {
+              this.seekBy(-10000, true);
+            }),
+          LongPressGesture({ repeat: false, duration: 400 })
+            .onAction(() => {
+              this.startHoldSeek();
+            })
+            .onActionEnd(() => {
+              this.stopHoldSeek();
             })
         )
       )

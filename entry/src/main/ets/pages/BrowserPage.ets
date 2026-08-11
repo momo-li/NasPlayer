@@ -145,6 +145,19 @@ export default struct BrowserPage {
     }
   }
 
+  /** 返回上级目录；无上级目录（共享根）时返回 false 让系统退出页面 */
+  private goBack(): boolean {
+    const cur = this.currentPath;
+    if (cur.length === 0) {
+      return false;
+    }
+    const idx = cur.lastIndexOf('\\');
+    // 单级目录（无 \）返回根目录；多级目录返回上一级
+    const parent = idx < 0 ? '' : (idx === 0 ? '' : cur.substring(0, idx));
+    this.load(parent);
+    return true;
+  }
+
   private openEntry(entry: VideoEntry): void {
     if (entry.isDirectory) {
       this.load(entry.path);
@@ -258,6 +271,9 @@ export default struct BrowserPage {
     }
     .title(this.currentPath.length > 0 ? this.currentPath.split('\\').pop() ?? '文件浏览' : '文件浏览')
     .hideTitleBar(false)
+    .onBackPressed(() => {
+      return this.goBack();
+    })
     .onReady((ctx: NavDestinationContext) => {
       this.navCtx = ctx;
     })
