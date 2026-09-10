@@ -1,5 +1,4 @@
 # NasPlayer
-<<<<<<< HEAD
 
 基于 HarmonyOS（ArkTS/ArkUI）的 NAS 视频播放器：自动发现局域网中的 SMB 主机，也支持通过 IPv6 或域名连接远程主机，浏览共享目录并直接播放视频文件，无需挂载或下载。
 
@@ -106,8 +105,3 @@ mp4、mkv、avi、mov、ts、m2ts、webm、wmv、flv、m4v、3gp、rmvb、rm、m
 |------|------|
 | `ohos.permission.INTERNET` | 连接 SMB 服务器、启动本地流媒体代理 |
 | `ohos.permission.GET_NETWORK_INFO` | 获取本机 IP 以扫描局域网主机 |
-=======
-原生鸿蒙app,基于SMB3共享技术
-播放nas中的视频
-支持ipv6,支持主机解析
->>>>>>> db309860f39d035b942fdfe970375bdffa258345
