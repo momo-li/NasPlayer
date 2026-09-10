@@ -8,12 +8,26 @@ const DOMAIN = 0x0000;
 const TAG = 'StreamServer';
 const CHUNK = 1048576;
 const SEND_TIMEOUT_MS = 5000;
+const PREFETCH_TAIL = 4 * 1048576;
+const PREFETCH_HEAD = 1048576;
+const CACHE_LIMIT = 32 * 1048576;
 
 interface HttpRequest {
   method: string;
   path: string;
   rangeStart: number | undefined;
   rangeEnd: number | undefined;
+}
+
+interface CacheBlock {
+  start: number;
+  data: Uint8Array;
+}
+
+class ClientSendError extends Error {
+  constructor(message: string) {
+    super(message);
+  }
 }
 
 export class StreamServer {
@@ -24,6 +38,11 @@ export class StreamServer {
   private connections: socket.TCPSocketConnection[] = [];
   private lastServeError: string = '';
   private sizeCache: Map<string, number> = new Map<string, number>();
+  private connSeq: number = 0;
+  private rangeCache: Map<string, CacheBlock[]> = new Map<string, CacheBlock[]>();
+  private cacheQueue: string[] = [];
+  private cacheBytes: number = 0;
+  private prefetched: Map<string, boolean> = new Map<string, boolean>();
 
   static getInstance(): StreamServer {
     return StreamServer.instance;
@@ -35,6 +54,10 @@ export class StreamServer {
 
   getLastServeError(): string {
     return this.lastServeError;
+  }
+
+  clearLastServeError(): void {
+    this.lastServeError = '';
   }
 
   getPort(): number {
@@ -98,6 +121,7 @@ export class StreamServer {
         }
       }
       this.sizeCache.clear();
+      this.clearRangeCache();
       // 等待 NETSTACK 释放旧 accept 循环，避免 accept fail (errno 22)
       await new Promise<void>((r) => {
         setTimeout(() => {
@@ -108,15 +132,90 @@ export class StreamServer {
     await this.start();
   }
 
-  /** 预热：确保 SMB 连接就绪并缓存文件大小，让 AVPlayer 请求到达时能立即响应 */
+  /** 预热：确保 SMB 连接就绪、缓存文件大小，并预取头部与尾部（moov）。
+   *  远端链路较慢时，预取耗时数秒，但可让 AVPlayer 首次起播的 Range 请求全部命中内存。 */
   async warmup(relPath: string): Promise<number> {
-    const cached = this.sizeCache.get(relPath);
-    if (cached !== undefined) {
-      return cached;
+    let size = this.sizeCache.get(relPath);
+    if (size === undefined) {
+      size = await SmbService.getInstance().getSize(relPath);
+      this.sizeCache.set(relPath, size);
     }
-    const size = await SmbService.getInstance().getSize(relPath);
-    this.sizeCache.set(relPath, size);
+    if (this.prefetched.get(relPath) !== true) {
+      this.prefetched.set(relPath, true);
+      try {
+        await this.prefetchRange(relPath, 0, Math.min(PREFETCH_HEAD, size));
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'prefetch head failed: %{public}s', JSON.stringify(e));
+      }
+      try {
+        const tailLen = Math.min(PREFETCH_TAIL, size);
+        await this.prefetchRange(relPath, Math.max(0, size - tailLen), tailLen);
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'prefetch tail failed: %{public}s', JSON.stringify(e));
+      }
+    }
     return size;
+  }
+
+  private async prefetchRange(relPath: string, start: number, len: number): Promise<void> {
+    const startedAt = Date.now();
+    const data = await SmbService.getInstance().readRange(relPath, start, len);
+    if (data.length === 0) {
+      return;
+    }
+    this.cachePut(relPath, start, data);
+    hilog.info(DOMAIN, TAG, 'prefetch off=%{public}d len=%{public}d cost=%{public}dms path=%{public}s',
+      start, data.length, Date.now() - startedAt, relPath);
+  }
+
+  private cachePut(relPath: string, start: number, data: Uint8Array): void {
+    let blocks = this.rangeCache.get(relPath);
+    if (blocks === undefined) {
+      blocks = [];
+      this.rangeCache.set(relPath, blocks);
+    }
+    blocks.push({ start: start, data: data });
+    this.cacheBytes += data.length;
+    if (this.cacheQueue.indexOf(relPath) < 0) {
+      this.cacheQueue.push(relPath);
+    }
+    while (this.cacheBytes > CACHE_LIMIT && this.cacheQueue.length > 1) {
+      const oldest = this.cacheQueue.shift();
+      if (oldest === undefined) {
+        break;
+      }
+      const oldBlocks = this.rangeCache.get(oldest);
+      if (oldBlocks !== undefined) {
+        for (let i = 0; i < oldBlocks.length; i++) {
+          this.cacheBytes -= oldBlocks[i].data.length;
+        }
+        this.rangeCache.delete(oldest);
+      }
+    }
+  }
+
+  /** 返回缓存中从 pos 开始连续可用的数据（可能短于 want，也可能为空） */
+  private cacheSlice(relPath: string, pos: number, want: number): Uint8Array {
+    const blocks = this.rangeCache.get(relPath);
+    if (blocks === undefined) {
+      return new Uint8Array(0);
+    }
+    for (let i = 0; i < blocks.length; i++) {
+      const b = blocks[i];
+      if (pos >= b.start && pos < b.start + b.data.length) {
+        const from = pos - b.start;
+        const n = Math.min(b.data.length - from, want);
+        return b.data.slice(from, from + n);
+      }
+    }
+    return new Uint8Array(0);
+  }
+
+  private clearRangeCache(): void {
+    this.rangeCache.clear();
+    this.cacheQueue = [];
+    this.cacheBytes = 0;
+    this.prefetched.clear();
   }
 
   async stop(): Promise<void> {
@@ -142,10 +241,15 @@ export class StreamServer {
         hilog.debug(DOMAIN, TAG, 'stop close conn failed');
       }
     }
+    this.sizeCache.clear();
+    this.clearRangeCache();
   }
 
   private handleConnection(conn: socket.TCPSocketConnection): void {
     this.connections.push(conn);
+    const connId = this.connSeq + 1;
+    this.connSeq = connId;
+    hilog.info(DOMAIN, TAG, 'conn#%{public}d accepted total=%{public}d', connId, this.connections.length);
     let buffer = new Uint8Array(0);
     let chain: Promise<void> = Promise.resolve();
     conn.on('message', (info: socket.SocketMessageInfo) => {
@@ -161,18 +265,18 @@ export class StreamServer {
         buffer = buffer.slice(headerEnd + 4);
         headerEnd = StreamServer.findHeaderEnd(buffer);
         chain = chain.then(async () => {
-          await this.serve(conn, req);
+          await this.serve(conn, req, connId);
         }).catch((e: BusinessError) => {
-          hilog.debug(DOMAIN, TAG, 'serve task error: %{public}s', JSON.stringify(e));
+          hilog.debug(DOMAIN, TAG, 'conn#%{public}d serve task error: %{public}s', connId, JSON.stringify(e));
         });
       }
     });
     conn.on('close', () => {
-      hilog.debug(DOMAIN, TAG, 'client connection closed');
+      hilog.info(DOMAIN, TAG, 'conn#%{public}d closed by client', connId);
       this.removeConnection(conn);
     });
     conn.on('error', (err: BusinessError) => {
-      hilog.debug(DOMAIN, TAG, 'client error: %{public}s', JSON.stringify(err));
+      hilog.warn(DOMAIN, TAG, 'conn#%{public}d client error: %{public}s', connId, JSON.stringify(err));
       this.removeConnection(conn);
     });
   }
@@ -248,15 +352,16 @@ export class StreamServer {
     return size;
   }
 
-  private async serve(conn: socket.TCPSocketConnection, req: HttpRequest): Promise<void> {
+  private async serve(conn: socket.TCPSocketConnection, req: HttpRequest, connId: number): Promise<void> {
+    const startedAt = Date.now();
     try {
       const qIdx = req.path.indexOf('?f=');
       let relPath = '';
       if (qIdx >= 0) {
         relPath = decodeURIComponent(req.path.substring(qIdx + 3));
       }
-      hilog.info(DOMAIN, TAG, 'serve req method=%{public}s range=[%{public}s,%{public}s] path=%{public}s',
-        req.method, String(req.rangeStart), String(req.rangeEnd), relPath);
+      hilog.info(DOMAIN, TAG, 'conn#%{public}d req method=%{public}s range=[%{public}s,%{public}s] path=%{public}s',
+        connId, req.method, String(req.rangeStart), String(req.rangeEnd), relPath);
       if (relPath.length === 0) {
         await StreamServer.sendText(conn, 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n');
         return;
@@ -285,38 +390,82 @@ export class StreamServer {
         await StreamServer.sendText(conn, 'HTTP/1.1 206 Partial Content\r\nContent-Range: bytes ' + start +
           '-' + end + '/' + size + '\r\nContent-Length: ' + len +
           '\r\nAccept-Ranges: bytes\r\nContent-Type: ' + type + '\r\n\r\n');
-        await this.streamRange(conn, relPath, start, len);
-        hilog.info(DOMAIN, TAG, 'range stream done len=%{public}d', len);
+        await this.streamRange(conn, relPath, start, len, connId);
+        hilog.info(DOMAIN, TAG, 'conn#%{public}d range done len=%{public}d cost=%{public}dms',
+          connId, len, Date.now() - startedAt);
       } else {
         await StreamServer.sendText(conn, 'HTTP/1.1 200 OK\r\nContent-Length: ' + size +
           '\r\nAccept-Ranges: bytes\r\nContent-Type: ' + type + '\r\n\r\n');
-        await this.streamRange(conn, relPath, 0, size);
-        hilog.info(DOMAIN, TAG, 'full stream done len=%{public}d', size);
+        await this.streamRange(conn, relPath, 0, size, connId);
+        hilog.info(DOMAIN, TAG, 'conn#%{public}d full done len=%{public}d cost=%{public}dms',
+          connId, size, Date.now() - startedAt);
       }
     } catch (e) {
-      hilog.error(DOMAIN, TAG, 'serve failed: %{public}s', JSON.stringify(e));
-      this.lastServeError = JSON.stringify(e);
+      const cost = Date.now() - startedAt;
+      if (e instanceof ClientSendError) {
+        hilog.warn(DOMAIN, TAG, 'conn#%{public}d client send aborted cost=%{public}dms: %{public}s',
+          connId, cost, e.message);
+      } else {
+        hilog.error(DOMAIN, TAG, 'conn#%{public}d serve failed cost=%{public}dms: %{public}s',
+          connId, cost, JSON.stringify(e));
+        this.lastServeError = JSON.stringify(e);
+      }
       try {
         await StreamServer.sendText(conn, 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n');
       } catch (e2) {
-        hilog.debug(DOMAIN, TAG, 'send 404 failed');
+        hilog.debug(DOMAIN, TAG, 'conn#%{public}d send 404 failed', connId);
       }
     }
   }
 
   private async streamRange(conn: socket.TCPSocketConnection, relPath: string,
-    start: number, len: number): Promise<void> {
+    start: number, len: number, connId: number): Promise<void> {
     let remaining = len;
     let pos = start;
     while (remaining > 0) {
       const n = Math.min(CHUNK, remaining);
-      const data = await SmbService.getInstance().readRange(relPath, pos, n);
+      const cached = this.cacheSlice(relPath, pos, n);
+      if (cached.length > 0) {
+        const cachedOpts: socket.TCPSendOptions = { data: cached.buffer as ArrayBuffer };
+        try {
+          await StreamServer.sendWithTimeout(conn, cachedOpts);
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'conn#%{public}d cache send failed pos=%{public}d: %{public}s',
+            connId, pos, JSON.stringify(e));
+          throw new ClientSendError(JSON.stringify(e));
+        }
+        hilog.debug(DOMAIN, TAG, 'conn#%{public}d cache hit pos=%{public}d len=%{public}d',
+          connId, pos, cached.length);
+        pos += cached.length;
+        remaining -= cached.length;
+        continue;
+      }
+      const smbStartedAt = Date.now();
+      let data: Uint8Array;
+      try {
+        data = await SmbService.getInstance().readRange(relPath, pos, n);
+      } catch (e) {
+        hilog.error(DOMAIN, TAG, 'conn#%{public}d SMB read failed pos=%{public}d len=%{public}d cost=%{public}dms: %{public}s',
+          connId, pos, n, Date.now() - smbStartedAt, JSON.stringify(e));
+        throw e as Error;
+      }
       if (data.length === 0) {
-        hilog.warn(DOMAIN, TAG, 'streamRange read empty at pos=%{public}d remaining=%{public}d', pos, remaining);
+        hilog.warn(DOMAIN, TAG, 'conn#%{public}d read empty at pos=%{public}d remaining=%{public}d',
+          connId, pos, remaining);
         break;
       }
+      const smbMs = Date.now() - smbStartedAt;
       const opts: socket.TCPSendOptions = { data: data.buffer as ArrayBuffer };
-      await StreamServer.sendWithTimeout(conn, opts);
+      const sendStartedAt = Date.now();
+      try {
+        await StreamServer.sendWithTimeout(conn, opts);
+      } catch (e) {
+        hilog.error(DOMAIN, TAG, 'conn#%{public}d local send failed pos=%{public}d len=%{public}d: %{public}s',
+          connId, pos, data.length, JSON.stringify(e));
+        throw new ClientSendError(JSON.stringify(e));
+      }
+      hilog.debug(DOMAIN, TAG, 'conn#%{public}d chunk pos=%{public}d len=%{public}d smb=%{public}dms send=%{public}dms',
+        connId, pos, data.length, smbMs, Date.now() - sendStartedAt);
       pos += data.length;
       remaining -= data.length;
     }
@@ -336,7 +485,11 @@ export class StreamServer {
 
   private static async sendText(conn: socket.TCPSocketConnection, text: string): Promise<void> {
     const opts: socket.TCPSendOptions = { data: StreamServer.asciiEncode(text).buffer as ArrayBuffer };
-    await StreamServer.sendWithTimeout(conn, opts);
+    try {
+      await StreamServer.sendWithTimeout(conn, opts);
+    } catch (e) {
+      throw new ClientSendError(JSON.stringify(e));
+    }
   }
 
   private static asciiEncode(s: string): Uint8Array {

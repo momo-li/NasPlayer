@@ -1,9 +1,12 @@
 import { socket } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { NetUtil } from '../service/NetUtil';
 
 const DOMAIN = 0x0000;
 const TAG = 'SmbSocket';
+const CONNECT_TIMEOUT_MS = 4000;
+const MULTI_CONNECT_TIMEOUT_MS = 3000;
 
 export class SmbSocket {
   private tcp: socket.TCPSocket | undefined = undefined;
@@ -12,9 +15,14 @@ export class SmbSocket {
   private onMessageCb: ((msg: Uint8Array) => void) | undefined = undefined;
   private onClosedCb: (() => void) | undefined = undefined;
   private sendChain: Promise<void> = Promise.resolve();
+  private connectedFamily: number = 0;
 
   get isClosed(): boolean {
     return this.closed;
+  }
+
+  get remoteFamily(): number {
+    return this.connectedFamily;
   }
 
   setOnMessage(cb: (msg: Uint8Array) => void): void {
@@ -26,16 +34,38 @@ export class SmbSocket {
   }
 
   async connect(host: string, port: number): Promise<void> {
-    const tcp = socket.constructTCPSocketInstance();
-    this.tcp = tcp;
-    const addr: socket.NetAddress = { address: host, port: port, family: 1 };
-    const opts: socket.TCPConnectOptions = { address: addr, timeout: 4000 };
-    try {
-      await tcp.connect(opts);
-    } catch (e) {
-      hilog.error(DOMAIN, TAG, 'tcp connect failed: %{public}s', JSON.stringify(e));
-      throw new Error('connect failed');
+    const candidates = await NetUtil.resolve(host);
+    let lastError: Error = new Error('connect failed');
+    for (let i = 0; i < candidates.length; i++) {
+      const target = candidates[i];
+      const tcp = socket.constructTCPSocketInstance();
+      const addr: socket.NetAddress = { address: target.address, port: port, family: target.family };
+      const timeout = candidates.length === 1 ? CONNECT_TIMEOUT_MS : MULTI_CONNECT_TIMEOUT_MS;
+      const opts: socket.TCPConnectOptions = { address: addr, timeout: timeout };
+      try {
+        await tcp.connect(opts);
+        this.tcp = tcp;
+        this.closed = false;
+        this.connectedFamily = target.family;
+        this.registerHandlers(tcp);
+        hilog.info(DOMAIN, TAG, 'tcp connected %{public}s family=%{public}d', target.address, target.family);
+        return;
+      } catch (e) {
+        lastError = e instanceof Error ? e : new Error('connect failed');
+        hilog.warn(DOMAIN, TAG, 'tcp connect %{public}s family=%{public}d failed: %{public}s',
+          target.address, target.family, JSON.stringify(e));
+        try {
+          await tcp.close();
+        } catch (e2) {
+          hilog.debug(DOMAIN, TAG, 'close failed attempt socket');
+        }
+      }
     }
+    hilog.error(DOMAIN, TAG, 'tcp connect all candidates failed: %{public}s', lastError.message);
+    throw lastError;
+  }
+
+  private registerHandlers(tcp: socket.TCPSocket): void {
     tcp.on('message', (info: socket.SocketMessageInfo) => {
       this.handleData(new Uint8Array(info.message));
     });
@@ -80,6 +110,7 @@ export class SmbSocket {
       return;
     }
     this.closed = true;
+    this.connectedFamily = 0;
     const tcp = this.tcp;
     this.tcp = undefined;
     if (tcp !== undefined) {

@@ -328,7 +328,8 @@ export default struct PlayerPage {
       }
     });
     player.on('error', (err: BusinessError) => {
-      console.error('player error: ' + JSON.stringify(err));
+      hilog.error(0x0000, 'NasPlayer', 'player error: %{public}s serveErr=%{public}s',
+        JSON.stringify(err), StreamServer.getInstance().getLastServeError());
       // 加载/准备期间出错由 playEntry catch 统一提示，这里避免重复弹提示
       if (!this.loading) {
         this.loading = false;
@@ -385,6 +386,7 @@ export default struct PlayerPage {
     this.currentTime = 0;
     this.duration = 0;
     try {
+      StreamServer.getInstance().clearLastServeError();
       await StreamServer.getInstance().start();
       hilog.info(0x0000, 'NasPlayer', 'playEntry: stream server started, port=%{public}d',
         StreamServer.getInstance().getPort());
@@ -401,9 +403,10 @@ export default struct PlayerPage {
       if (this.surfaceId.length === 0) {
         throw new Error('视频 surface 未就绪');
       }
-      // 预热：提前确保 SMB 连接就绪并缓存文件大小，避免 AVPlayer 请求时等太久。
+      // 预热：提前确保 SMB 连接就绪并缓存文件头/尾（moov）。远端链路较慢时需要数秒，
+      // 但可以让 AVPlayer 首次起播就成功，避免反复失败重试。
       // 预热失败直接抛出，快速进入重试，避免在 AVPlayer 阶段白等
-      await this.withTimeout(StreamServer.getInstance().warmup(entry.path), 6000, '视频信息加载');
+      await this.withTimeout(StreamServer.getInstance().warmup(entry.path), 20000, '视频信息加载');
       const url = StreamServer.getInstance().urlFor(entry.path);
       player.url = url;
       hilog.info(0x0000, 'NasPlayer', 'playEntry: url set, state=%{public}s', player.state);
@@ -437,10 +440,11 @@ export default struct PlayerPage {
       this.loading = false;
     } catch (e) {
       console.error('play failed: ' + JSON.stringify(e));
-      hilog.error(0x0000, 'NasPlayer', 'playEntry failed: %{public}s', JSON.stringify(e));
-      // 网络类失败：静默自动重试（保持加载中，不弹提示），最多 2 次
-      if (retryCount < 2 && PlayerPage.isNetworkish(e, StreamServer.getInstance().getLastServeError())) {
-        hilog.info(0x0000, 'NasPlayer', 'playEntry network issue, silent retry %{public}d/2', retryCount + 1);
+      hilog.error(0x0000, 'NasPlayer', 'playEntry failed: %{public}s serveErr=%{public}s',
+        JSON.stringify(e), StreamServer.getInstance().getLastServeError());
+      // 网络类失败：静默自动重试（保持加载中，不弹提示），最多 3 次
+      if (retryCount < 3 && PlayerPage.isNetworkish(e, StreamServer.getInstance().getLastServeError())) {
+        hilog.info(0x0000, 'NasPlayer', 'playEntry network issue, silent retry %{public}d/3', retryCount + 1);
         // 重试前重建播放器，避免残留状态
         try {
           const old = this.avPlayer;

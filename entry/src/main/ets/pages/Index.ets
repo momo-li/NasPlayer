@@ -4,6 +4,7 @@ import { NeighborHost } from '../model/NeighborHost';
 import { BrowserParams, PlayerParams, SharesParams } from '../model/RouteParams';
 import { ConfigStore } from '../service/ConfigStore';
 import { NeighborScanner } from '../service/NeighborScanner';
+import { NetUtil } from '../service/NetUtil';
 import { SmbService } from '../service/SmbService';
 import { SmbError } from '../smb/SmbClient';
 import BrowserPage from './BrowserPage';
@@ -27,10 +28,12 @@ struct Index {
   @State dialogManual: boolean = false;
   @State dialogUsername: string = '';
   @State dialogPassword: string = '';
+  @State lastHost: string = '';
 
   aboutToAppear(): void {
     this.loadCredentials();
     this.loadCachedHosts();
+    this.loadLastHost();
   }
 
   async loadCachedHosts(): Promise<void> {
@@ -57,6 +60,22 @@ struct Index {
     }
   }
 
+  async loadLastHost(): Promise<void> {
+    try {
+      this.lastHost = await ConfigStore.loadLastHost(this.getUIContext().getHostContext() as common.UIAbilityContext);
+    } catch (e) {
+      this.lastHost = '';
+    }
+  }
+
+  async saveLastHost(host: string): Promise<void> {
+    try {
+      await ConfigStore.saveLastHost(this.getUIContext().getHostContext() as common.UIAbilityContext, host);
+    } catch (e) {
+      hilog.warn(0x0000, 'NasPlayer', 'saveLastHost failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
   private showToast(msg: string): void {
     this.getUIContext().getPromptAction().showToast({ message: msg });
   }
@@ -69,6 +88,12 @@ struct Index {
     this.errorText = '';
     this.progressText = '正在扫描局域网…';
     try {
+      const hasIPv4 = await NetUtil.hasLocalIPv4();
+      if (!hasIPv4) {
+        this.hosts = [];
+        this.progressText = '当前无 IPv4 网络，请手动输入 IPv6 地址或主机名';
+        return;
+      }
       const found = await NeighborScanner.scan((done: number, total: number) => {
         this.progressText = '扫描中 ' + done + '/' + total;
       });
@@ -111,6 +136,8 @@ struct Index {
           this.showToast('连接超时：主机无响应，请检查网络');
         } else if (msg.indexOf('断开') >= 0 || msg.indexOf('closed') >= 0) {
           this.showToast('连接被中断：服务器拒绝了连接');
+        } else if (msg.indexOf('ipv6') >= 0 || msg.indexOf('unreachable') >= 0 || msg.indexOf('2303200') >= 0) {
+          this.showToast('IPv6 连接失败：请确认地址与作用域（如 fe80::1%wlan0），或改用 IPv4/主机名');
         } else if (msg.indexOf('connect') >= 0 || msg.indexOf('socket') >= 0) {
           this.showToast('无法连接主机（' + msg + '），请确认手机与主机在同一网络');
         } else if (msg.length > 0) {
@@ -133,7 +160,7 @@ struct Index {
   }
 
   private showManualDialog(): void {
-    this.dialogHost = '';
+    this.dialogHost = this.lastHost;
     this.dialogManual = true;
     this.dialogUsername = this.username;
     this.dialogPassword = this.password;
@@ -141,7 +168,18 @@ struct Index {
   }
 
   private confirmDialog(): void {
-    const h = this.dialogManual ? this.dialogHost.trim() : this.dialogHost;
+    let h = this.dialogHost;
+    if (this.dialogManual) {
+      const raw = this.dialogHost.trim();
+      const err = NetUtil.validate(raw);
+      if (err.length > 0) {
+        this.showToast(err);
+        return;
+      }
+      h = NetUtil.normalize(raw);
+      this.lastHost = h;
+      this.saveLastHost(h);
+    }
     this.dialogVisible = false;
     this.doConnect(h, this.dialogUsername.trim(), this.dialogPassword);
   }
@@ -157,6 +195,8 @@ struct Index {
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.text_main'))
           .width('100%')
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
         Text(host.dialectText.length > 0 ? host.dialectText + ' 服务器' : '端口 445 已开放')
           .fontSize(12)
           .fontColor(host.dialectText.length > 0 ? $r('app.color.theme_primary') : $r('app.color.text_secondary'))
@@ -256,7 +296,7 @@ struct Index {
             .scrollBar(BarState.Off)
           }
 
-          Button('手动输入主机 IP')
+          Button('手动输入主机地址')
             .width('calc(100% - 28vp)')
             .height(44)
             .fontSize(15)
@@ -295,13 +335,17 @@ struct Index {
               .width('100%')
 
             if (this.dialogManual) {
-              TextInput({ placeholder: '主机 IP 地址', text: this.dialogHost })
+              TextInput({ placeholder: 'IPv4 / IPv6 地址或主机名', text: this.dialogHost })
                 .width('100%')
                 .height(44)
                 .fontSize(15)
                 .onChange((value: string) => {
                   this.dialogHost = value;
                 })
+              Text('IPv6 示例：2408:8216::1 或 [fe80::1%wlan0]')
+                .fontSize(12)
+                .fontColor($r('app.color.text_secondary'))
+                .width('100%')
             }
 
             TextInput({ placeholder: '用户名', text: this.dialogUsername })

@@ -3,6 +3,7 @@ import { SmbSocket } from './SmbSocket';
 import { SmbPacket, SmbStatus, CreateInfo, QueryEntry, NegotiateInfo, SmbHeader, RpcShareInfo } from './SmbPacket';
 import { Ntlm } from './Ntlm';
 import { ShareEntry } from '../model/ShareEntry';
+import { NetUtil } from '../service/NetUtil';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const DOMAIN = 0x0000;
@@ -11,8 +12,9 @@ const TAG = 'SmbClient';
 const DIALECT_3_1_1 = 0x0311;
 const DIALECT_3_0 = 0x0300;
 const REQUEST_TIMEOUT_MS = 8000;
-const MAX_READ_CHUNK = 65536;
-const READ_TRIAL_CHUNK = 262144;
+const MIN_READ_CHUNK = 65536;
+const MAX_READ_CHUNK = 262144;
+const READ_FLIGHT_LIMIT = 8;
 const STATUS_INVALID_PARAMETER = 0xc000000d;
 
 export class SmbError extends Error {
@@ -64,6 +66,8 @@ export class SmbClient {
   private pending: Map<number, PendingEntry> = new Map<number, PendingEntry>();
   private connected: boolean = false;
   private dirCache: Map<string, DirCacheEntry> = new Map<string, DirCacheEntry>();
+  private serverMaxReadSize: number = 0;
+  private static readChunkFallback: number = 0;
 
   get isConnected(): boolean {
     return this.connected;
@@ -144,7 +148,8 @@ export class SmbClient {
   }
 
   private async sendRequest(command: number, body: Uint8Array, useSession: boolean, useTree: boolean,
-    sign: boolean, captureReq: boolean, captureResp: boolean): Promise<Uint8Array> {
+    sign: boolean, captureReq: boolean, captureResp: boolean,
+    creditCharge: number = 0): Promise<Uint8Array> {
     if (this.socket.isClosed) {
       throw new SmbError(-1, '连接已断开');
     }
@@ -154,7 +159,8 @@ export class SmbClient {
       flags = SmbPacket.FLAG_SIGNED;
     }
     let raw = SmbPacket.build(command, id, useSession ? this.sessionIdLo : 0,
-      useSession ? this.sessionIdHi : 0, useTree ? this.treeId : 0, this.processId, flags, body);
+      useSession ? this.sessionIdHi : 0, useTree ? this.treeId : 0, this.processId, flags, body,
+      creditCharge);
     if ((flags & SmbPacket.FLAG_SIGNED) !== 0) {
       const sig = await this.signMessage(raw);
       raw = SmbPacket.replaceSignature(raw, sig);
@@ -173,7 +179,7 @@ export class SmbClient {
 
   private async negotiate(): Promise<void> {
     const guid = await SmbCrypto.randomBytes(16);
-    const body = SmbPacket.negotiateReq(guid, this.host);
+    const body = SmbPacket.negotiateReq(guid, NetUtil.stripZone(this.host));
     const id = this.nextMessageId();
     this.preauthNegotiateReq = SmbPacket.build(SmbCommand.NEGOTIATE, id, 0, 0, 0, this.processId, 0, body);
     this.preauthMsgs = [];
@@ -189,7 +195,9 @@ export class SmbClient {
     }
     const info: NegotiateInfo = SmbPacket.parseNegotiateResp(SmbPacket.body(resp));
     this.dialectRevision = info.dialectRevision;
-    hilog.info(DOMAIN, TAG, 'negotiated dialect=0x%{public}x', this.dialectRevision);
+    this.serverMaxReadSize = info.maxReadSize;
+    hilog.info(DOMAIN, TAG, 'negotiated dialect=0x%{public}s maxReadSize=%{public}s',
+      this.dialectRevision.toString(16), String(this.serverMaxReadSize));
   }
 
   private async sessionSetupStep1(): Promise<void> {
@@ -217,7 +225,7 @@ export class SmbClient {
   }
 
   private async sessionSetupStep2(): Promise<void> {
-    const type3 = await Ntlm.createType3(this.username, this.host, this.domain,
+    const type3 = await Ntlm.createType3(this.username, 'NasPlayer', this.domain,
       this.serverChallenge, this.password, this.targetInfo);
     this.sessionKey = type3.sessionKey;
 
@@ -241,7 +249,7 @@ export class SmbClient {
   }
 
   private async treeConnect(): Promise<void> {
-    const unc = '\\\\' + this.host + '\\' + this.share;
+    const unc = '\\\\' + NetUtil.stripZone(this.host) + '\\' + this.share;
     const body = SmbPacket.treeConnectReq(unc);
     const resp = await this.sendRequest(SmbCommand.TREE_CONNECT, body, true, false, true, false, false);
     const hdr = SmbPacket.parseHeader(resp);
@@ -253,7 +261,7 @@ export class SmbClient {
 
   async connect(host: string, share: string, username: string, password: string, domain: string,
     port: number): Promise<void> {
-    this.host = host;
+    this.host = NetUtil.normalize(host);
     this.share = share;
     this.username = username;
     this.password = password;
@@ -266,15 +274,15 @@ export class SmbClient {
       this.onClosed();
     });
 
-    hilog.info(DOMAIN, TAG, 'connecting %{public}s:%{public}d', host, port);
+    hilog.info(DOMAIN, TAG, 'connecting %{public}s:%{public}d', this.host, port);
     try {
-      await this.socket.connect(host, port);
+      await this.socket.connect(this.host, port);
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'tcp connect error: %{public}s stack=%{public}s', JSON.stringify(e),
         e instanceof Error && e.stack !== undefined ? e.stack : '');
       throw e as Error;
     }
-    hilog.info(DOMAIN, TAG, 'tcp connected');
+    hilog.info(DOMAIN, TAG, 'tcp connected family=%{public}d', this.socket.remoteFamily);
     await this.negotiate();
     hilog.info(DOMAIN, TAG, 'negotiate done dialect=0x%{public}x', this.dialectRevision);
     try {
@@ -379,7 +387,7 @@ export class SmbClient {
       if (bindAck.length < 16 || bindAck[2] !== 0x0c) {
         throw new SmbError(-1, 'RPC bind 失败');
       }
-      await this.pipeWriteRpc(pipeId, SmbPacket.rpcNetShareEnumPdu(1, this.host));
+      await this.pipeWriteRpc(pipeId, SmbPacket.rpcNetShareEnumPdu(1, NetUtil.stripZone(this.host)));
       hilog.info(DOMAIN, TAG, 'enumerate: enum written');
       let stub = new Uint8Array(0);
       let done = false;
@@ -583,36 +591,79 @@ export class SmbClient {
     if (length <= 0) {
       return new Uint8Array(0);
     }
+    const startedAt = Date.now();
+    try {
+      const out = await this.readRangeWithChunk(relPath, offset, length, this.readChunkSize());
+      hilog.debug(DOMAIN, TAG, 'readRange off=%{public}d req=%{public}d got=%{public}d cost=%{public}dms',
+        offset, length, out.length, Date.now() - startedAt);
+      return out;
+    } catch (e) {
+      const current = this.readChunkSize();
+      if (current > MIN_READ_CHUNK) {
+        hilog.warn(DOMAIN, TAG, 'readRange failed with chunk=%{public}d, fallback to %{public}d: %{public}s',
+          current, MIN_READ_CHUNK, JSON.stringify(e));
+        SmbClient.readChunkFallback = MIN_READ_CHUNK;
+        const out = await this.readRangeWithChunk(relPath, offset, length, MIN_READ_CHUNK);
+        hilog.debug(DOMAIN, TAG, 'readRange fallback off=%{public}d req=%{public}d got=%{public}d cost=%{public}dms',
+          offset, length, out.length, Date.now() - startedAt);
+        return out;
+      }
+      throw e as Error;
+    }
+  }
+
+  private readChunkSize(): number {
+    if (SmbClient.readChunkFallback > 0) {
+      return SmbClient.readChunkFallback;
+    }
+    const advertised = this.serverMaxReadSize;
+    if (advertised <= 0) {
+      return MIN_READ_CHUNK;
+    }
+    const size = Math.min(advertised, MAX_READ_CHUNK);
+    return size < 4096 ? 4096 : size;
+  }
+
+  private async readRangeWithChunk(relPath: string, offset: number, length: number,
+    chunkSize: number): Promise<Uint8Array> {
     const f = await this.create(relPath, false);
     try {
-      const chunks: Uint8Array[] = [];
-      let remaining = length;
-      let pos = offset;
-      const flight: Promise<Uint8Array>[] = [];
-      const FLIGHT_LIMIT = 8;
-      while (remaining > 0) {
-        const n = Math.min(MAX_READ_CHUNK, remaining);
-        flight.push(this.readChunk(f.fileId, pos, n));
-        pos += n;
-        remaining -= n;
-        if (flight.length >= FLIGHT_LIMIT) {
-          const batch = await Promise.all(flight);
-          for (let i = 0; i < batch.length; i++) {
-            chunks.push(batch[i]);
-          }
-          flight.length = 0;
+      const out: Uint8Array[] = [];
+      const end = offset + length;
+      let expected = offset;
+      while (expected < end) {
+        const count = Math.min(READ_FLIGHT_LIMIT, Math.ceil((end - expected) / chunkSize));
+        const jobs: Promise<Uint8Array>[] = [];
+        const positions: number[] = [];
+        let pos = expected;
+        for (let i = 0; i < count; i++) {
+          const n = Math.min(chunkSize, end - pos);
+          positions.push(pos);
+          jobs.push(this.readChunk(f.fileId, pos, n));
+          pos += n;
         }
-      }
-      if (flight.length > 0) {
-        const batch = await Promise.all(flight);
+        const batch = await Promise.all(jobs);
+        let sawEof = false;
         for (let i = 0; i < batch.length; i++) {
-          chunks.push(batch[i]);
+          const data = batch[i];
+          if (data.length === 0) {
+            sawEof = true;
+            continue;
+          }
+          if (positions[i] !== expected) {
+            continue;
+          }
+          out.push(data);
+          expected += data.length;
+        }
+        if (sawEof) {
+          break;
         }
       }
-      if (chunks.length === 0) {
+      if (out.length === 0) {
         return new Uint8Array(0);
       }
-      return SmbCrypto.concat(chunks);
+      return SmbCrypto.concat(out);
     } finally {
       await this.closeFile(f.fileId);
     }
@@ -620,12 +671,18 @@ export class SmbClient {
 
   private async readChunk(fileId: Uint8Array, offset: number, length: number): Promise<Uint8Array> {
     const body = SmbPacket.readReq(fileId, offset, length);
+    const startedAt = Date.now();
     const resp = await this.sendRequest(SmbCommand.READ, body, true, true, true, false, false);
     const hdr = SmbPacket.parseHeader(resp);
     if (hdr.status !== SmbStatus.SUCCESS) {
       throw new SmbError(hdr.status, '[READ] ' + SmbStatus.describe(hdr.status));
     }
-    return SmbPacket.parseReadResp(SmbPacket.body(resp));
+    const data = SmbPacket.parseReadResp(SmbPacket.body(resp));
+    if (data.length !== length) {
+      hilog.debug(DOMAIN, TAG, 'READ short req=%{public}d got=%{public}d cost=%{public}dms',
+        length, data.length, Date.now() - startedAt);
+    }
+    return data;
   }
 
   async disconnect(): Promise<void> {

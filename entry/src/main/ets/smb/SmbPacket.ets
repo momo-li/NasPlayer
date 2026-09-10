@@ -194,11 +194,12 @@ export class SmbPacket {
   static readonly FLAG_SIGNED = 0x00000008;
 
   static build(command: number, messageId: number, sessionIdLo: number, sessionIdHi: number,
-    treeId: number, processId: number, flags: number, body: Uint8Array): Uint8Array {
+    treeId: number, processId: number, flags: number, body: Uint8Array,
+    creditCharge: number = 0): Uint8Array {
     const w = new ByteWriter(SMB2_HEADER_LEN + body.length);
     w.bytes(new Uint8Array([0xfe, 0x53, 0x4d, 0x42]));
     w.u16le(64);
-    w.u16le(0);
+    w.u16le(creditCharge);
     w.u32le(0);
     w.u16le(command);
     w.u16le(126);
@@ -347,9 +348,8 @@ export class SmbPacket {
       r.bytes(16);
       r.u32le();
       r.u32le();
-      r.u32le();
-      r.u32le();
       info.maxReadSize = r.u32le();
+      r.u32le();
     }
     return info;
   }

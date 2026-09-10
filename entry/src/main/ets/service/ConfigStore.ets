@@ -64,6 +64,17 @@ export class ConfigStore {
     return cred;
   }
 
+  static async saveLastHost(context: common.UIAbilityContext, host: string): Promise<void> {
+    const store = preferences.getPreferencesSync(context, { name: PREFS_NAME });
+    store.putSync('last_host', host);
+    await store.flush();
+  }
+
+  static async loadLastHost(context: common.UIAbilityContext): Promise<string> {
+    const store = preferences.getPreferencesSync(context, { name: PREFS_NAME });
+    return store.getSync('last_host', '') as string;
+  }
+
   static async saveShares(context: common.UIAbilityContext, host: string,
     shares: ShareEntry[]): Promise<void> {
     const store = preferences.getPreferencesSync(context, { name: PREFS_NAME });

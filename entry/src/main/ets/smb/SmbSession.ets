@@ -11,6 +11,7 @@ const TAG = 'SmbSession';
 export class SmbSession {
   private client: SmbClient | undefined = undefined;
   private config: SmbConfig | undefined = undefined;
+  private reconnecting: Promise<void> | undefined = undefined;
 
   get isConnected(): boolean {
     return this.client !== undefined && this.client.isConnected;
@@ -104,6 +105,10 @@ export class SmbSession {
   }
 
   private async readdirOnce(relPath: string, force: boolean): Promise<VideoEntry[]> {
+    const pending = this.reconnecting;
+    if (pending !== undefined) {
+      await pending;
+    }
     if (this.client === undefined) {
       throw new Error('未连接');
     }
@@ -141,6 +146,10 @@ export class SmbSession {
   }
 
   private async getSizeOnce(relPath: string): Promise<number> {
+    const pending = this.reconnecting;
+    if (pending !== undefined) {
+      await pending;
+    }
     if (this.client === undefined) {
       throw new Error('未连接');
     }
@@ -161,6 +170,10 @@ export class SmbSession {
   }
 
   private async readRangeOnce(relPath: string, offset: number, length: number): Promise<Uint8Array> {
+    const pending = this.reconnecting;
+    if (pending !== undefined) {
+      await pending;
+    }
     if (this.client === undefined) {
       throw new Error('未连接');
     }
@@ -181,6 +194,21 @@ export class SmbSession {
   }
 
   private async reconnect(): Promise<void> {
+    const pending = this.reconnecting;
+    if (pending !== undefined) {
+      await pending;
+      return;
+    }
+    const task = this.doReconnect();
+    this.reconnecting = task;
+    try {
+      await task;
+    } finally {
+      this.reconnecting = undefined;
+    }
+  }
+
+  private async doReconnect(): Promise<void> {
     const cfg = this.config;
     if (cfg === undefined) {
       return;

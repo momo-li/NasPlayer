@@ -2,6 +2,7 @@ import { ShareEntry } from '../model/ShareEntry';
 import { BrowserParams, SharesParams } from '../model/RouteParams';
 import { SmbService } from '../service/SmbService';
 import { ConfigStore } from '../service/ConfigStore';
+import { NetUtil } from '../service/NetUtil';
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
@@ -20,6 +21,14 @@ export default struct ShareListPage {
 
   private showToast(msg: string): void {
     this.getUIContext().getPromptAction().showToast({ message: msg });
+  }
+
+  private titleText(): string {
+    const h = NetUtil.formatForDisplay(this.params.host);
+    if (h.length > 24) {
+      return h.substring(0, 23) + '… 的共享';
+    }
+    return h + ' 的共享';
   }
 
   private filterShares(list: ShareEntry[]): ShareEntry[] {
@@ -195,7 +204,7 @@ export default struct ShareListPage {
       .height('100%')
       .backgroundColor($r('app.color.theme_bg'))
     }
-    .title(this.params.host + ' 的共享')
+    .title(this.titleText())
     .hideTitleBar(false)
     .onReady((ctx: NavDestinationContext) => {
       this.navCtx = ctx;
