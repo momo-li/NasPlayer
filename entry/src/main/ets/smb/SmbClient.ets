@@ -68,6 +68,9 @@ export class SmbClient {
   private dirCache: Map<string, DirCacheEntry> = new Map<string, DirCacheEntry>();
   private serverMaxReadSize: number = 0;
   private static readChunkFallback: number = 0;
+  /** SET_INFO 兼容变体候选（见 SmbPacket.setInfoReq）与已确认可用变体 */
+  private static SET_INFO_VARIANTS: number[] = [0, 1, 3, 2, 4];
+  private static setInfoVariant: number = -1;
 
   get isConnected(): boolean {
     return this.connected;
@@ -609,7 +612,7 @@ export class SmbClient {
     }
     const f = await this.createRaw(SmbPacket.createDeleteReq(relPath, isDirectory));
     try {
-      await this.setDeletePending(f.fileId);
+      await this.sendSetInfo(f.fileId, 13, SmbPacket.dispositionInfoBuffer());
     } catch (e) {
       // SET_INFO 失败：关闭句柄后透出原始错误
       await this.closeFile(f.fileId);
@@ -628,13 +631,67 @@ export class SmbClient {
     return false;
   }
 
-  private async setDeletePending(fileId: Uint8Array): Promise<void> {
-    const resp = await this.sendRequest(SmbCommand.SET_INFO,
-      SmbPacket.setInfoDispositionReq(fileId), true, true, true, false, false);
-    const hdr = SmbPacket.parseHeader(resp);
-    if (hdr.status !== SmbStatus.SUCCESS) {
-      throw new SmbError(hdr.status, '[SET_INFO] ' + SmbStatus.describe(hdr.status));
+  /** SET_INFO 兼容探测：依次尝试各变体，成功后记住可用变体供后续复用 */
+  private async sendSetInfo(fileId: Uint8Array, infoClass: number, buffer: Uint8Array): Promise<void> {
+    const order: number[] = [];
+    if (SmbClient.setInfoVariant >= 0) {
+      order.push(SmbClient.setInfoVariant);
     }
+    for (let i = 0; i < SmbClient.SET_INFO_VARIANTS.length; i++) {
+      const v = SmbClient.SET_INFO_VARIANTS[i];
+      if (order.indexOf(v) < 0) {
+        order.push(v);
+      }
+    }
+    let lastStatus: number = 0;
+    let lastDesc: string = '';
+    for (let i = 0; i < order.length; i++) {
+      const variant = order[i];
+      const charge = (variant === 1 || variant === 4) ? 1 : 0;
+      const body = SmbPacket.setInfoReq(fileId, infoClass, buffer, variant);
+      const resp = await this.sendRequest(SmbCommand.SET_INFO, body, true, true, true, false, false, charge);
+      const hdr = SmbPacket.parseHeader(resp);
+      if (hdr.status === SmbStatus.SUCCESS) {
+        SmbClient.setInfoVariant = variant;
+        hilog.info(DOMAIN, TAG, 'setinfo ok class=%{public}d variant=%{public}d charge=%{public}d',
+          infoClass, variant, charge);
+        return;
+      }
+      lastStatus = hdr.status;
+      lastDesc = SmbStatus.describe(hdr.status);
+      hilog.warn(DOMAIN, TAG, 'setinfo class=%{public}d variant=%{public}d charge=%{public}d failed status=%{public}s %{public}s',
+        infoClass, variant, charge, '0x' + (hdr.status >>> 0).toString(16), lastDesc);
+      if (hdr.status !== SmbStatus.INVALID_PARAMETER && hdr.status !== SmbStatus.NOT_SUPPORTED) {
+        break;
+      }
+    }
+    throw new SmbError(lastStatus, '[SET_INFO] ' + lastDesc);
+  }
+
+  /** 重命名：DELETE 权限打开（重命名要求 DELETE 访问）→ SET_INFO FileRenameInformation → CLOSE。
+   *  注：部分 NAS 的 SMB 服务未实现 SET_INFO，此时返回明确提示。 */
+  async renameEntry(relPath: string, newName: string, isDirectory: boolean): Promise<void> {
+    let parent = '';
+    const idx = relPath.lastIndexOf('\\');
+    if (idx > 0) {
+      parent = relPath.substring(0, idx);
+    }
+    const dest = parent.length > 0 ? parent + '\\' + newName : newName;
+    const info = await this.createRaw(SmbPacket.createDeleteReq(relPath, isDirectory));
+    try {
+      await this.sendSetInfo(info.fileId, 10, SmbPacket.renameInfoBuffer(dest, false));
+    } catch (e) {
+      if (e instanceof SmbError &&
+        (e.status === SmbStatus.INVALID_PARAMETER || e.status === SmbStatus.NOT_SUPPORTED)) {
+        hilog.warn(DOMAIN, TAG, 'rename unsupported by server path=%{public}s', relPath);
+        throw new SmbError(e.status, '该服务器的 SMB 服务未实现重命名（SET_INFO）');
+      }
+      throw e as Error;
+    } finally {
+      await this.closeFile(info.fileId);
+    }
+    hilog.info(DOMAIN, TAG, 'rename ok %{public}s -> %{public}s', relPath, dest);
+    this.dirCache.clear();
   }
 
   private async closeFileStrict(fileId: Uint8Array): Promise<void> {

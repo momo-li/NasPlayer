@@ -14,6 +14,11 @@ export interface ImageViewerParams {
   index: number;
 }
 
+export interface AudioPlayerParams {
+  files: VideoEntry[];
+  index: number;
+}
+
 export interface SharesParams {
   host: string;
 }

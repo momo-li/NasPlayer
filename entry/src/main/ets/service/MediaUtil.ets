@@ -5,6 +5,9 @@ export class MediaUtil {
   private static readonly IMAGE_EXTS: string[] = ['jpg', 'jpeg', 'jfif', 'png', 'gif', 'webp',
     'bmp', 'heif', 'heic', 'avif', 'ico'];
 
+  /** AVPlayer 支持的音频格式：M4A、AAC、MP3、OGG、WAV、FLAC、AMR */
+  private static readonly AUDIO_EXTS: string[] = ['mp3', 'm4a', 'aac', 'wav', 'ogg', 'oga', 'flac', 'amr'];
+
   static isVideo(name: string): boolean {
     const idx = name.lastIndexOf('.');
     if (idx < 0 || idx === name.length - 1) {
@@ -21,6 +24,15 @@ export class MediaUtil {
     }
     const ext = name.substring(idx + 1).toLowerCase();
     return MediaUtil.IMAGE_EXTS.indexOf(ext) >= 0;
+  }
+
+  static isAudio(name: string): boolean {
+    const idx = name.lastIndexOf('.');
+    if (idx < 0 || idx === name.length - 1) {
+      return false;
+    }
+    const ext = name.substring(idx + 1).toLowerCase();
+    return MediaUtil.AUDIO_EXTS.indexOf(ext) >= 0;
   }
 
   static contentType(path: string): string {
@@ -52,6 +64,27 @@ export class MediaUtil {
     }
     if (ext === 'mpg' || ext === 'mpeg' || ext === 'vob') {
       return 'video/mpeg';
+    }
+    if (ext === 'mp3') {
+      return 'audio/mpeg';
+    }
+    if (ext === 'm4a') {
+      return 'audio/mp4';
+    }
+    if (ext === 'aac') {
+      return 'audio/aac';
+    }
+    if (ext === 'wav') {
+      return 'audio/wav';
+    }
+    if (ext === 'flac') {
+      return 'audio/flac';
+    }
+    if (ext === 'ogg' || ext === 'oga') {
+      return 'audio/ogg';
+    }
+    if (ext === 'amr') {
+      return 'audio/amr';
     }
     return 'application/octet-stream';
   }

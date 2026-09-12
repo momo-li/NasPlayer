@@ -16,6 +16,9 @@
       },
       {
         "name": "ohos.permission.GET_NETWORK_INFO"
+      },
+      {
+        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
       }
     ],
     "abilities": [
@@ -28,6 +31,9 @@
         "startWindowIcon": "$media:startIcon",
         "startWindowBackground": "$color:start_window_background",
         "orientation": "auto_rotation",
+        "backgroundModes": [
+          "audioPlayback"
+        ],
         "exported": true,
         "skills": [
           {

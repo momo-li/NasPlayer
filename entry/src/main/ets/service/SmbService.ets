@@ -60,6 +60,10 @@ export class SmbService {
     await this.session.delete(relPath, isDirectory);
   }
 
+  async renameEntry(relPath: string, newName: string, isDirectory: boolean): Promise<void> {
+    await this.session.rename(relPath, newName, isDirectory);
+  }
+
   async disconnect(): Promise<void> {
     await this.session.disconnect();
   }
