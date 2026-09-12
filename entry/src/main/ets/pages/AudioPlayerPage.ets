@@ -43,6 +43,7 @@ export default struct AudioPlayerPage {
   @State albumText: string = '';
   @State cover: image.PixelMap | undefined = undefined;
 
+  
   private speedValues: media.PlaybackSpeed[] = [
     media.PlaybackSpeed.SPEED_FORWARD_0_75_X,
     media.PlaybackSpeed.SPEED_FORWARD_1_00_X,
