@@ -1,3 +1,4 @@
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { VideoEntry } from '../model/VideoEntry';
 import { BrowserParams, ImageViewerParams, PlayerParams } from '../model/RouteParams';
 import { SmbService } from '../service/SmbService';
@@ -118,6 +119,8 @@ export default struct BrowserPage {
   @State errorText: string = '';
   @State emptyText: string = '';
   @State refreshing: boolean = false;
+  @State deleteTarget: VideoEntry | undefined = undefined;
+  @State deleting: boolean = false;
 
   aboutToAppear(): void {
     this.load(this.params.sharePath);
@@ -219,83 +222,215 @@ export default struct BrowserPage {
     }
   }
 
+  private deleteName(): string {
+    const t = this.deleteTarget;
+    return t !== undefined ? t.name : '';
+  }
+
+  private deleteHint(): string {
+    const t = this.deleteTarget;
+    if (t !== undefined && t.isDirectory) {
+      return '删除后无法恢复，文件夹必须为空';
+    }
+    return '删除后无法恢复，请谨慎操作';
+  }
+
+  /** 删除前二次确认（后续新增操作按钮时，各自入口保持独立） */
+  private confirmDelete(): void {
+    const target = this.deleteTarget;
+    if (target === undefined || this.deleting) {
+      return;
+    }
+    const kind = target.isDirectory ? '文件夹' : '文件';
+    const cancelBtn: AlertDialogButtonOptions = {
+      value: '取消',
+      action: () => {
+      }
+    };
+    const deleteBtn: AlertDialogButtonOptions = {
+      value: '删除',
+      fontColor: '#E53935',
+      action: () => {
+        this.doDelete(target);
+      }
+    };
+    const options: AlertDialogParamWithButtons = {
+      title: '确认删除',
+      message: '确定要删除' + kind + '“' + target.name + '”吗？此操作不可恢复。',
+      autoCancel: true,
+      primaryButton: cancelBtn,
+      secondaryButton: deleteBtn
+    };
+    this.getUIContext().showAlertDialog(options);
+  }
+
+  private async doDelete(target: VideoEntry): Promise<void> {
+    if (this.deleting) {
+      return;
+    }
+    this.deleting = true;
+    this.showToast('正在删除…');
+    try {
+      await SmbService.getInstance().deleteEntry(target.path, target.isDirectory);
+      hilog.info(0x0000, 'NasPlayer', 'delete ok path=%{public}s', target.path);
+      this.deleteTarget = undefined;
+      this.showToast('已删除：' + target.name);
+      await this.load(this.currentPath, true);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      hilog.error(0x0000, 'NasPlayer', 'delete failed path=%{public}s err=%{public}s', target.path, msg);
+      this.showToast('删除失败：' + msg);
+    } finally {
+      this.deleting = false;
+    }
+  }
+
   build() {
     NavDestination() {
-      Column() {
-        if (this.loading) {
-          Column({ space: 8 }) {
-            LoadingProgress()
-              .width(40)
-              .height(40)
-              .color($r('app.color.theme_primary'))
-            Text('加载中…')
-              .fontSize(13)
-              .fontColor($r('app.color.text_secondary'))
-          }
-          .width('100%')
-          .height('100%')
-          .justifyContent(FlexAlign.Center)
-        } else if (this.errorText.length > 0) {
-          Column({ space: 10 }) {
-            Text(this.errorText)
-              .fontSize(14)
-              .fontColor($r('app.color.text_main'))
-            Button('重试')
-              .fontSize(14)
-              .height(36)
-              .backgroundColor($r('app.color.theme_primary'))
-              .onClick(() => {
-                this.load(this.currentPath);
-              })
-          }
-          .width('100%')
-          .height('100%')
-          .justifyContent(FlexAlign.Center)
-        } else if (this.emptyText.length > 0) {
-          Column() {
-            Text(this.emptyText)
-              .fontSize(14)
-              .fontColor($r('app.color.text_secondary'))
-          }
-          .width('100%')
-          .height('100%')
-          .justifyContent(FlexAlign.Center)
-        } else {
-          Refresh({ refreshing: $$this.refreshing }) {
-            List({ space: 8 }) {
-              LazyForEach(this.source, (item: VideoEntry) => {
-                ListItem() {
-                  VideoCell({
-                    path: item.path,
-                    name: item.name,
-                    fileSize: item.size,
-                    isDir: item.isDirectory,
-                    modifiedTime: item.modifiedTime
-                  })
-                }
-                .onClick(() => {
-                  this.openEntry(item);
-                })
-              }, (item: VideoEntry) => item.path)
+      Stack() {
+        Column() {
+          if (this.loading) {
+            Column({ space: 8 }) {
+              LoadingProgress()
+                .width(40)
+                .height(40)
+                .color($r('app.color.theme_primary'))
+              Text('加载中…')
+                .fontSize(13)
+                .fontColor($r('app.color.text_secondary'))
             }
-            .padding({ left: 14, right: 14, bottom: 14 })
             .width('100%')
+            .height('100%')
+            .justifyContent(FlexAlign.Center)
+          } else if (this.errorText.length > 0) {
+            Column({ space: 10 }) {
+              Text(this.errorText)
+                .fontSize(14)
+                .fontColor($r('app.color.text_main'))
+              Button('重试')
+                .fontSize(14)
+                .height(36)
+                .backgroundColor($r('app.color.theme_primary'))
+                .onClick(() => {
+                  this.load(this.currentPath);
+                })
+            }
+            .width('100%')
+            .height('100%')
+            .justifyContent(FlexAlign.Center)
+          } else if (this.emptyText.length > 0) {
+            Column() {
+              Text(this.emptyText)
+                .fontSize(14)
+                .fontColor($r('app.color.text_secondary'))
+            }
+            .width('100%')
+            .height('100%')
+            .justifyContent(FlexAlign.Center)
+          } else {
+            Refresh({ refreshing: $$this.refreshing }) {
+              List({ space: 8 }) {
+                LazyForEach(this.source, (item: VideoEntry) => {
+                  ListItem() {
+                    VideoCell({
+                      path: item.path,
+                      name: item.name,
+                      fileSize: item.size,
+                      isDir: item.isDirectory,
+                      modifiedTime: item.modifiedTime
+                    })
+                  }
+                  .onClick(() => {
+                    this.openEntry(item);
+                  })
+                  .gesture(
+                    LongPressGesture({ repeat: false, duration: 500 })
+                      .onAction(() => {
+                        if (!this.deleting) {
+                          this.deleteTarget = item;
+                        }
+                      })
+                  )
+                }, (item: VideoEntry) => item.path)
+              }
+              .padding({ left: 14, right: 14, bottom: 14 })
+              .width('100%')
+              .layoutWeight(1)
+              .scrollBar(BarState.Off)
+            }
+            .onRefreshing(() => {
+              this.refreshing = true;
+              this.load(this.currentPath, true).finally(() => {
+                this.refreshing = false;
+              });
+            })
             .layoutWeight(1)
-            .scrollBar(BarState.Off)
+            .width('100%')
           }
-          .onRefreshing(() => {
-            this.refreshing = true;
-            this.load(this.currentPath, true).finally(() => {
-              this.refreshing = false;
-            });
-          })
-          .layoutWeight(1)
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor($r('app.color.theme_bg'))
+
+        if (this.deleteTarget !== undefined) {
+          Stack({ alignContent: Alignment.Center }) {
+            Column()
+              .width('100%')
+              .height('100%')
+              .backgroundColor('#80000000')
+              .onClick(() => {
+                if (!this.deleting) {
+                  this.deleteTarget = undefined;
+                }
+              })
+
+            Column({ space: 14 }) {
+              Text(this.deleteName())
+                .fontSize(16)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_main'))
+                .maxLines(2)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .width('100%')
+              Text(this.deleteHint())
+                .fontSize(12)
+                .fontColor($r('app.color.text_secondary'))
+                .width('100%')
+              // 操作按钮区：后续新增操作（重命名/移动等）在此追加按钮
+              Column({ space: 10 }) {
+                Button(this.deleting ? '删除中…' : '删除')
+                  .width('100%')
+                  .height(42)
+                  .fontSize(15)
+                  .backgroundColor($r('app.color.text_error'))
+                  .enabled(!this.deleting)
+                  .onClick(() => {
+                    this.confirmDelete();
+                  })
+              }
+              .width('100%')
+              Button('取消')
+                .width('100%')
+                .height(42)
+                .fontSize(15)
+                .backgroundColor($r('app.color.button_cancel_bg'))
+                .fontColor($r('app.color.text_main'))
+                .onClick(() => {
+                  this.deleteTarget = undefined;
+                })
+            }
+            .width(300)
+            .padding(20)
+            .backgroundColor($r('app.color.card_bg'))
+            .borderRadius(16)
+            .offset({ y: -40 })
+          }
           .width('100%')
+          .height('100%')
         }
       }
       .width('100%')
       .height('100%')
-      .backgroundColor($r('app.color.theme_bg'))
     }
     .title(this.currentPath.length > 0 ? this.currentPath.split('\\').pop() ?? '文件浏览' : '文件浏览')
     .hideTitleBar(false)
