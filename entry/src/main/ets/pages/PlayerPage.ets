@@ -42,6 +42,10 @@ export default struct PlayerPage {
   // 挖孔/刘海安全区避让高度（vp）
   @State topSafeHeight: number = 0;
   @State bottomSafeHeight: number = 0;
+  /** 右侧挖孔避让宽度（vp，横屏挖孔在右侧时使用） */
+  @State rightSafeWidth: number = 0;
+  /** 播放器可视区域宽度（vp，用于把亮度弹窗贴到屏幕左侧） */
+  @State screenWidth: number = 0;
   private safeAreaListening: boolean = false;
 
   private scaleValues: media.VideoScaleType[] = [
@@ -142,6 +146,19 @@ export default struct PlayerPage {
     }
   }
 
+  /** 亮度弹窗宽度（vp） */
+  private static readonly BRIGHTNESS_PANEL_W = 72;
+  /** 亮度弹窗距屏幕边缘的距离（避让右侧挖孔 + 12vp） */
+  private static readonly BRIGHTNESS_PANEL_MARGIN = 12;
+
+  /** 亮度弹窗水平偏移：横竖屏都贴屏幕右侧（父容器居中布局，正偏移向右） */
+  private brightnessPanelOffsetX(): number {
+    const w = this.screenWidth > 0 ? this.screenWidth : 360;
+    const panelHalf = PlayerPage.BRIGHTNESS_PANEL_W / 2;
+    const margin = this.rightSafeWidth + PlayerPage.BRIGHTNESS_PANEL_MARGIN;
+    return w / 2 - panelHalf - margin;
+  }
+
   /** 根据状态决定全屏/显示系统栏：裁剪模式或横屏时全屏，适应模式竖屏时显示系统栏 */
   private applyFullscreenState(): void {
     const needFullscreen: boolean = this.isLandscape || this.scaleIdx === 1;
@@ -188,10 +205,12 @@ export default struct PlayerPage {
       const ui = this.getUIContext();
       let top = 0;
       let bottom = 0;
+      let right = 0;
       // 挖孔/刘海区域（前置摄像头）——全屏时状态栏隐藏，TYPE_SYSTEM 可能为 0，必须用 TYPE_CUTOUT
       try {
         const cutout = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_CUTOUT);
         top = Math.max(top, cutout.topRect.height);
+        right = Math.max(right, cutout.rightRect.width);
       } catch (e) {
         console.error('get cutout area failed: ' + JSON.stringify(e));
       }
@@ -212,8 +231,9 @@ export default struct PlayerPage {
       }
       this.topSafeHeight = ui.px2vp(top);
       this.bottomSafeHeight = ui.px2vp(bottom);
-      hilog.info(0x0000, 'NasPlayer', 'safe area updated top=%{public}d bottom=%{public}d',
-        top, bottom);
+      this.rightSafeWidth = ui.px2vp(right);
+      hilog.info(0x0000, 'NasPlayer', 'safe area updated top=%{public}d bottom=%{public}d right=%{public}d',
+        top, bottom, right);
     } catch (e) {
       console.error('update safe area failed: ' + JSON.stringify(e));
     }
@@ -790,47 +810,6 @@ export default struct PlayerPage {
           }
         }
 
-        if (this.brightnessPanel) {
-          Column({ space: 14 }) {
-            Text('亮度 ' + Math.round(this.screenBrightness * 100) + '%')
-              .fontSize(15)
-              .fontColor(Color.White)
-            Row({ space: 10 }) {
-              Text('☾')
-                .fontSize(16)
-                .fontColor(Color.White)
-              Slider({
-                value: this.screenBrightness,
-                min: 0,
-                max: 1,
-                step: 0.01,
-                style: SliderStyle.OutSet
-              })
-                .layoutWeight(1)
-                .onChange((v: number) => {
-                  this.setBrightness(v);
-                })
-              Text('☀')
-                .fontSize(16)
-                .fontColor(Color.White)
-            }
-            .width(260)
-            Button('完成')
-              .fontSize(13)
-              .height(32)
-              .backgroundColor($r('app.color.theme_primary'))
-              .onClick(() => {
-                this.brightnessPanel = false;
-              })
-          }
-          .padding({ left: 20, right: 20, top: 16, bottom: 16 })
-          .backgroundColor('rgba(0,0,0,0.72)')
-          .borderRadius(14)
-          .onClick(() => {
-            this.brightnessPanel = false;
-          })
-        }
-
         if (this.holdX2Tip) {
           Text('X2')
             .fontSize(26)
@@ -926,11 +905,65 @@ export default struct PlayerPage {
           .height('100%')
           .backgroundColor($r('app.color.player_overlay'))
         }
+
+        // 亮度弹窗：竖直显示在屏幕右侧，且吞掉自身范围内的滑动/长按，避免误触发切视频、快进快退与 X2 倍速
+        if (this.brightnessPanel) {
+          Column({ space: 12 }) {
+            Text('☀')
+              .fontSize(16)
+              .fontColor(Color.White)
+            Slider({
+              value: this.screenBrightness,
+              min: 0,
+              max: 1,
+              step: 0.01,
+              style: SliderStyle.OutSet,
+              direction: Axis.Vertical,
+              reverse: true
+            })
+              .width(40)
+              .height(170)
+              .onChange((v: number) => {
+                this.setBrightness(v);
+              })
+            Text(Math.round(this.screenBrightness * 100) + '%')
+              .fontSize(12)
+              .fontColor(Color.White)
+          }
+          .width(PlayerPage.BRIGHTNESS_PANEL_W)
+          .padding({ left: 12, right: 12, top: 14, bottom: 14 })
+          .backgroundColor('rgba(0,0,0,0.35)')
+          .borderRadius(14)
+          .offset({ x: this.brightnessPanelOffsetX() })
+          .onClick(() => {
+            this.brightnessPanel = false;
+          })
+          .gesture(
+            GestureGroup(GestureMode.Parallel,
+              PanGesture({ direction: PanDirection.All, distance: 5 })
+                .onActionEnd(() => {
+                }),
+              LongPressGesture({ repeat: false, duration: 400 })
+                .onAction(() => {
+                })
+            )
+          )
+        }
       }
       .width('100%')
       .height('100%')
       .backgroundColor($r('app.color.player_bg'))
+      .onAreaChange((_oldArea: Area, newArea: Area) => {
+        const w = newArea.width;
+        if (typeof w === 'number') {
+          this.screenWidth = w;
+        }
+      })
       .onClick(() => {
+        if (this.brightnessPanel) {
+          this.brightnessPanel = false;
+          return;
+        }
         this.toggleControls();
       })
       .gesture(
