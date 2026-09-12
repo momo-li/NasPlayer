@@ -444,14 +444,15 @@ export class SmbPacket {
   }
 
   static createReq(fileName: string, isDirectory: boolean): Uint8Array {
-    return SmbPacket.createReqWithAccess(fileName, isDirectory, 0x00120089);
+    return SmbPacket.createReqWithAccess(fileName, isDirectory, 0x00120089, !isDirectory);
   }
 
   static createPipeReq(pipeName: string): Uint8Array {
-    return SmbPacket.createReqWithAccess(pipeName, false, 0x00120183);
+    return SmbPacket.createReqWithAccess(pipeName, false, 0x00120183, false);
   }
 
-  private static createReqWithAccess(fileName: string, isDirectory: boolean, accessMask: number): Uint8Array {
+  private static createReqWithAccess(fileName: string, isDirectory: boolean, accessMask: number,
+    nonDirectory: boolean): Uint8Array {
     const name = SmbCrypto.utf16leEncode(fileName);
     const bufLen = name.length === 0 ? 1 : name.length;
     const w = new ByteWriter(56 + bufLen);
@@ -465,7 +466,9 @@ export class SmbPacket {
     w.u32le(isDirectory ? 0x10 : 0);
     w.u32le(0x7);
     w.u32le(0x1);
-    w.u32le(isDirectory ? 0x00000001 : 0);
+    // CreateOptions：目录必须 FILE_DIRECTORY_FILE(0x01)；文件必须 FILE_NON_DIRECTORY_FILE(0x40)。
+    // 否则服务端会把带点的目录当普通文件打开成功，导致目录被识别成文件而无法进入。
+    w.u32le(isDirectory ? 0x00000001 : (nonDirectory ? 0x00000040 : 0));
     w.u16le(120);
     w.u16le(name.length);
     w.u32le(0);
