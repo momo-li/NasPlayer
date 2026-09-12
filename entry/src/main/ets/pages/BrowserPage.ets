@@ -1,5 +1,5 @@
 import { VideoEntry } from '../model/VideoEntry';
-import { BrowserParams, PlayerParams } from '../model/RouteParams';
+import { BrowserParams, ImageViewerParams, PlayerParams } from '../model/RouteParams';
 import { SmbService } from '../service/SmbService';
 import { MediaUtil } from '../service/MediaUtil';
 
@@ -163,8 +163,12 @@ export default struct BrowserPage {
       this.load(entry.path);
       return;
     }
+    if (MediaUtil.isImage(entry.name)) {
+      this.openImages(entry);
+      return;
+    }
     if (!MediaUtil.isVideo(entry.name)) {
-      this.showToast('不是可播放的视频文件');
+      this.showToast('暂不支持该文件类型');
       return;
     }
     const videos: VideoEntry[] = [];
@@ -188,6 +192,30 @@ export default struct BrowserPage {
     const p: PlayerParams = { files: videos, index: index };
     if (this.navCtx !== undefined) {
       this.navCtx.pathStack.pushPathByName('Player', p);
+    }
+  }
+
+  private openImages(entry: VideoEntry): void {
+    const images: VideoEntry[] = [];
+    for (let i = 0; i < this.source.totalCount(); i++) {
+      const item = this.source.getData(i);
+      if (!item.isDirectory && MediaUtil.isImage(item.name)) {
+        images.push(item);
+      }
+    }
+    if (images.length === 0) {
+      return;
+    }
+    let index = 0;
+    for (let i = 0; i < images.length; i++) {
+      if (images[i].path === entry.path) {
+        index = i;
+        break;
+      }
+    }
+    const p: ImageViewerParams = { files: images, index: index };
+    if (this.navCtx !== undefined) {
+      this.navCtx.pathStack.pushPathByName('ImageViewer', p);
     }
   }
 

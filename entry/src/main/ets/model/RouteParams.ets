@@ -9,6 +9,11 @@ export interface PlayerParams {
   index: number;
 }
 
+export interface ImageViewerParams {
+  files: VideoEntry[];
+  index: number;
+}
+
 export interface SharesParams {
   host: string;
 }

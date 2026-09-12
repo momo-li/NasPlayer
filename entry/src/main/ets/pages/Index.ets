@@ -1,13 +1,14 @@
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { NeighborHost } from '../model/NeighborHost';
-import { BrowserParams, PlayerParams, SharesParams } from '../model/RouteParams';
+import { BrowserParams, ImageViewerParams, PlayerParams, SharesParams } from '../model/RouteParams';
 import { ConfigStore } from '../service/ConfigStore';
 import { NeighborScanner } from '../service/NeighborScanner';
 import { NetUtil } from '../service/NetUtil';
 import { SmbService } from '../service/SmbService';
 import { SmbError } from '../smb/SmbClient';
 import BrowserPage from './BrowserPage';
+import ImageViewerPage from './ImageViewerPage';
 import PlayerPage from './PlayerPage';
 import ShareListPage from './ShareListPage';
 
@@ -222,6 +223,8 @@ struct Index {
       BrowserPage({ params: param as BrowserParams })
     } else if (name === 'Player') {
       PlayerPage({ params: param as PlayerParams })
+    } else if (name === 'ImageViewer') {
+      ImageViewerPage({ params: param as ImageViewerParams })
     }
   }
 
