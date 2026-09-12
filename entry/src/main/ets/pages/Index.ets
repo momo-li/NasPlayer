@@ -1,12 +1,13 @@
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { NeighborHost } from '../model/NeighborHost';
-import { BrowserParams, ImageViewerParams, PlayerParams, SharesParams } from '../model/RouteParams';
+import { AudioPlayerParams, BrowserParams, ImageViewerParams, PlayerParams, SharesParams } from '../model/RouteParams';
 import { ConfigStore } from '../service/ConfigStore';
 import { NeighborScanner } from '../service/NeighborScanner';
 import { NetUtil } from '../service/NetUtil';
 import { SmbService } from '../service/SmbService';
 import { SmbError } from '../smb/SmbClient';
+import AudioPlayerPage from './AudioPlayerPage';
 import BrowserPage from './BrowserPage';
 import ImageViewerPage from './ImageViewerPage';
 import PlayerPage from './PlayerPage';
@@ -225,6 +226,8 @@ struct Index {
       PlayerPage({ params: param as PlayerParams })
     } else if (name === 'ImageViewer') {
       ImageViewerPage({ params: param as ImageViewerParams })
+    } else if (name === 'AudioPlayer') {
+      AudioPlayerPage({ params: param as AudioPlayerParams })
     }
   }
 

@@ -1,6 +1,6 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { VideoEntry } from '../model/VideoEntry';
-import { BrowserParams, ImageViewerParams, PlayerParams } from '../model/RouteParams';
+import { BrowserParams, ImageViewerParams, PlayerParams, AudioPlayerParams } from '../model/RouteParams';
 import { SmbService } from '../service/SmbService';
 import { MediaUtil } from '../service/MediaUtil';
 
@@ -119,8 +119,12 @@ export default struct BrowserPage {
   @State errorText: string = '';
   @State emptyText: string = '';
   @State refreshing: boolean = false;
-  @State deleteTarget: VideoEntry | undefined = undefined;
+  /** 长按选中的条目：操作面板（重命名/删除等）的目标 */
+  @State actionTarget: VideoEntry | undefined = undefined;
   @State deleting: boolean = false;
+  @State renameTarget: VideoEntry | undefined = undefined;
+  @State renameText: string = '';
+  @State renaming: boolean = false;
 
   aboutToAppear(): void {
     this.load(this.params.sharePath);
@@ -168,6 +172,10 @@ export default struct BrowserPage {
     }
     if (MediaUtil.isImage(entry.name)) {
       this.openImages(entry);
+      return;
+    }
+    if (MediaUtil.isAudio(entry.name)) {
+      this.openAudios(entry);
       return;
     }
     if (!MediaUtil.isVideo(entry.name)) {
@@ -222,22 +230,49 @@ export default struct BrowserPage {
     }
   }
 
-  private deleteName(): string {
-    const t = this.deleteTarget;
+  private openAudios(entry: VideoEntry): void {
+    const audios: VideoEntry[] = [];
+    for (let i = 0; i < this.source.totalCount(); i++) {
+      const item = this.source.getData(i);
+      if (!item.isDirectory && MediaUtil.isAudio(item.name)) {
+        audios.push(item);
+      }
+    }
+    if (audios.length === 0) {
+      return;
+    }
+    let index = 0;
+    for (let i = 0; i < audios.length; i++) {
+      if (audios[i].path === entry.path) {
+        index = i;
+        break;
+      }
+    }
+    const p: AudioPlayerParams = { files: audios, index: index };
+    if (this.navCtx !== undefined) {
+      this.navCtx.pathStack.pushPathByName('AudioPlayer', p);
+    }
+  }
+
+  private actionName(): string {
+    const t = this.actionTarget;
     return t !== undefined ? t.name : '';
   }
 
-  private deleteHint(): string {
-    const t = this.deleteTarget;
-    if (t !== undefined && t.isDirectory) {
-      return '删除后无法恢复，文件夹必须为空';
+  private actionHint(): string {
+    const t = this.actionTarget;
+    if (t === undefined) {
+      return '';
     }
-    return '删除后无法恢复，请谨慎操作';
+    if (t.isDirectory) {
+      return '文件夹';
+    }
+    return MediaUtil.formatSize(t.size) + '  ·  ' + MediaUtil.formatTime(t.modifiedTime);
   }
 
-  /** 删除前二次确认（后续新增操作按钮时，各自入口保持独立） */
+  /** 删除前二次确认 */
   private confirmDelete(): void {
-    const target = this.deleteTarget;
+    const target = this.actionTarget;
     if (target === undefined || this.deleting) {
       return;
     }
@@ -273,7 +308,7 @@ export default struct BrowserPage {
     try {
       await SmbService.getInstance().deleteEntry(target.path, target.isDirectory);
       hilog.info(0x0000, 'NasPlayer', 'delete ok path=%{public}s', target.path);
-      this.deleteTarget = undefined;
+      this.actionTarget = undefined;
       this.showToast('已删除：' + target.name);
       await this.load(this.currentPath, true);
     } catch (e) {
@@ -282,6 +317,64 @@ export default struct BrowserPage {
       this.showToast('删除失败：' + msg);
     } finally {
       this.deleting = false;
+    }
+  }
+
+  /** 打开重命名弹窗（关闭操作面板） */
+  private startRename(): void {
+    const target = this.actionTarget;
+    if (target === undefined || this.deleting) {
+      return;
+    }
+    this.actionTarget = undefined;
+    this.renameText = target.name;
+    this.renameTarget = target;
+  }
+
+  private static validateName(name: string): string {
+    if (name.length === 0) {
+      return '名称不能为空';
+    }
+    if (name === '.' || name === '..') {
+      return '名称无效';
+    }
+    const invalid = '\\/:*?"<>|';
+    for (let i = 0; i < name.length; i++) {
+      if (invalid.indexOf(name.charAt(i)) >= 0) {
+        return '名称不能包含 \\ / : * ? " < > | 字符';
+      }
+    }
+    return '';
+  }
+
+  private async doRename(): Promise<void> {
+    const target = this.renameTarget;
+    if (target === undefined || this.renaming) {
+      return;
+    }
+    const name = this.renameText.trim();
+    const err = BrowserPage.validateName(name);
+    if (err.length > 0) {
+      this.showToast(err);
+      return;
+    }
+    if (name === target.name) {
+      this.renameTarget = undefined;
+      return;
+    }
+    this.renaming = true;
+    try {
+      await SmbService.getInstance().renameEntry(target.path, name, target.isDirectory);
+      hilog.info(0x0000, 'NasPlayer', 'rename ok path=%{public}s newName=%{public}s', target.path, name);
+      this.renameTarget = undefined;
+      this.showToast('已重命名为：' + name);
+      await this.load(this.currentPath, true);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      hilog.error(0x0000, 'NasPlayer', 'rename failed path=%{public}s err=%{public}s', target.path, msg);
+      this.showToast('重命名失败：' + msg);
+    } finally {
+      this.renaming = false;
     }
   }
 
@@ -346,8 +439,8 @@ export default struct BrowserPage {
                   .gesture(
                     LongPressGesture({ repeat: false, duration: 500 })
                       .onAction(() => {
-                        if (!this.deleting) {
-                          this.deleteTarget = item;
+                        if (!this.deleting && !this.renaming) {
+                          this.actionTarget = item;
                         }
                       })
                   )
@@ -372,7 +465,7 @@ export default struct BrowserPage {
         .height('100%')
         .backgroundColor($r('app.color.theme_bg'))
 
-        if (this.deleteTarget !== undefined) {
+        if (this.actionTarget !== undefined) {
           Stack({ alignContent: Alignment.Center }) {
             Column()
               .width('100%')
@@ -380,24 +473,33 @@ export default struct BrowserPage {
               .backgroundColor('#80000000')
               .onClick(() => {
                 if (!this.deleting) {
-                  this.deleteTarget = undefined;
+                  this.actionTarget = undefined;
                 }
               })
 
             Column({ space: 14 }) {
-              Text(this.deleteName())
+              Text(this.actionName())
                 .fontSize(16)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.text_main'))
                 .maxLines(2)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
                 .width('100%')
-              Text(this.deleteHint())
+              Text(this.actionHint())
                 .fontSize(12)
                 .fontColor($r('app.color.text_secondary'))
                 .width('100%')
-              // 操作按钮区：后续新增操作（重命名/移动等）在此追加按钮
+              // 操作按钮区：后续新增操作（移动/复制等）在此追加按钮
               Column({ space: 10 }) {
+                Button('重命名')
+                  .width('100%')
+                  .height(42)
+                  .fontSize(15)
+                  .backgroundColor($r('app.color.theme_primary'))
+                  .enabled(!this.deleting)
+                  .onClick(() => {
+                    this.startRename();
+                  })
                 Button(this.deleting ? '删除中…' : '删除')
                   .width('100%')
                   .height(42)
@@ -416,7 +518,7 @@ export default struct BrowserPage {
                 .backgroundColor($r('app.color.button_cancel_bg'))
                 .fontColor($r('app.color.text_main'))
                 .onClick(() => {
-                  this.deleteTarget = undefined;
+                  this.actionTarget = undefined;
                 })
             }
             .width(300)
@@ -424,6 +526,69 @@ export default struct BrowserPage {
             .backgroundColor($r('app.color.card_bg'))
             .borderRadius(16)
             .offset({ y: -40 })
+          }
+          .width('100%')
+          .height('100%')
+        }
+
+        if (this.renameTarget !== undefined) {
+          Stack({ alignContent: Alignment.Center }) {
+            Column()
+              .width('100%')
+              .height('100%')
+              .backgroundColor('#80000000')
+              .onClick(() => {
+                if (!this.renaming) {
+                  this.renameTarget = undefined;
+                }
+              })
+
+            Column({ space: 14 }) {
+              Text('重命名')
+                .fontSize(18)
+                .fontWeight(FontWeight.Bold)
+                .fontColor($r('app.color.text_main'))
+                .width('100%')
+              TextInput({ placeholder: '新名称', text: this.renameText })
+                .width('100%')
+                .height(44)
+                .fontSize(15)
+                .maxLength(255)
+                .enterKeyType(EnterKeyType.Done)
+                .onChange((value: string) => {
+                  this.renameText = value;
+                })
+                .onSubmit(() => {
+                  this.doRename();
+                })
+              Row({ space: 12 }) {
+                Button('取消')
+                  .layoutWeight(1)
+                  .height(42)
+                  .fontSize(15)
+                  .backgroundColor($r('app.color.button_cancel_bg'))
+                  .fontColor($r('app.color.text_main'))
+                  .enabled(!this.renaming)
+                  .onClick(() => {
+                    this.renameTarget = undefined;
+                  })
+                Button(this.renaming ? '重命名中…' : '确定')
+                  .layoutWeight(1)
+                  .height(42)
+                  .fontSize(15)
+                  .backgroundColor($r('app.color.theme_primary'))
+                  .enabled(!this.renaming)
+                  .onClick(() => {
+                    this.doRename();
+                  })
+              }
+              .width('100%')
+            }
+            .width(320)
+            .padding(20)
+            .backgroundColor($r('app.color.card_bg'))
+            .borderRadius(16)
+            .offset({ y: -60 })
           }
           .width('100%')
           .height('100%')

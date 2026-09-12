@@ -33,6 +33,8 @@ export class SmbStatus {
   static readonly NOT_A_DIRECTORY = 0xc0000103;
   static readonly CANNOT_DELETE = 0xc0000121;
   static readonly NOT_SUPPORTED = 0xc00000bb;
+  static readonly OBJECT_NAME_INVALID = 0xc0000033;
+  static readonly OBJECT_NAME_COLLISION = 0xc0000035;
 
   static describe(status: number): string {
     if (status === SmbStatus.LOGON_FAILURE) {
@@ -65,6 +67,15 @@ export class SmbStatus {
     if (status === SmbStatus.NOT_A_DIRECTORY) {
       return '目标不是文件夹';
     }
+    if (status === SmbStatus.OBJECT_NAME_INVALID) {
+      return '名称无效或包含非法字符';
+    }
+    if (status === SmbStatus.OBJECT_NAME_COLLISION) {
+      return '同名文件已存在';
+    }
+    if (status === SmbStatus.NOT_SUPPORTED) {
+      return '服务器不支持该请求';
+    }
     if (status === 0xc0000072) {
       return '账户已被禁用';
     }
@@ -79,9 +90,6 @@ export class SmbStatus {
     }
     if (status === 0xc0000184) {
       return '协议状态错误（预认证校验失败）';
-    }
-    if (status === 0xc00000bb) {
-      return '服务器不支持该请求';
     }
     return 'SMB 错误 0x' + (status >>> 0).toString(16).toUpperCase();
   }
@@ -484,19 +492,46 @@ export class SmbPacket {
     return SmbPacket.createReqWithAccess(fileName, isDirectory, 0x00010000, !isDirectory, 0x00001000);
   }
 
-  /** SET_INFO / FileDispositionInformation(13)：DeletePending=1，配合 CLOSE 完成删除 */
-  static setInfoDispositionReq(fileId: Uint8Array): Uint8Array {
-    const w = new ByteWriter(33);
-    w.u16le(33);
+  /** SET_INFO 通用请求。variant 用于兼容不同服务端实现：
+   *  0/1 = 标准（StructureSize 33，固定体 32，BufferOffset 96）
+   *  2   = StructureSize 声明为 32
+   *  3/4 = 固定体补 1 字节（StructureSize 33，BufferOffset 97） */
+  static setInfoReq(fileId: Uint8Array, infoClass: number, buffer: Uint8Array, variant: number): Uint8Array {
+    const pad = (variant === 3 || variant === 4) ? 1 : 0;
+    const fixedSize = 32 + pad;
+    const w = new ByteWriter(fixedSize + buffer.length);
+    w.u16le(variant === 2 ? 32 : 33);
     w.u8(1);      // InfoType: SMB2_0_INFO_FILE
-    w.u8(13);     // FileInformationClass: FileDispositionInformation
-    w.u32le(1);   // BufferLength
-    w.u16le(96);  // BufferOffset = SMB2 header(64) + 32
+    w.u8(infoClass);
+    w.u32le(buffer.length);
+    w.u16le(64 + fixedSize);  // BufferOffset = SMB2 header(64) + 固定体长度
     w.u16le(0);   // Reserved
     w.u32le(0);   // AdditionalInformation
     w.bytes(fileId);
-    w.u8(1);      // DeletePending = true
+    if (pad === 1) {
+      w.u8(0);
+    }
+    w.bytes(buffer);
     return w.finish();
+  }
+
+  /** FILE_DISPOSITION_INFORMATION：DeletePending = true */
+  static dispositionInfoBuffer(): Uint8Array {
+    return new Uint8Array([1]);
+  }
+
+  /** FILE_RENAME_INFORMATION：newPath 为相对共享根的完整目标路径（如 dir\new.txt） */
+  static renameInfoBuffer(newPath: string, replaceIfExists: boolean): Uint8Array {
+    const name = SmbCrypto.utf16leEncode(newPath);
+    const buf = new Uint8Array(20 + name.length);
+    buf[0] = replaceIfExists ? 1 : 0;
+    // 1..7 对齐填充；8..15 RootDirectory 必须为 0
+    buf[16] = name.length & 0xff;
+    buf[17] = (name.length >> 8) & 0xff;
+    buf[18] = (name.length >> 16) & 0xff;
+    buf[19] = (name.length >> 24) & 0xff;
+    buf.set(name, 20);
+    return buf;
   }
 
   private static createReqWithAccess(fileName: string, isDirectory: boolean, accessMask: number,
