@@ -2,6 +2,9 @@ export class MediaUtil {
   private static readonly VIDEO_EXTS: string[] = ['mp4', 'mkv', 'avi', 'mov', 'ts', 'm2ts', 'webm',
     'wmv', 'flv', 'm4v', '3gp', 'rmvb', 'rm', 'mpg', 'mpeg', 'vob'];
 
+  private static readonly IMAGE_EXTS: string[] = ['jpg', 'jpeg', 'jfif', 'png', 'gif', 'webp',
+    'bmp', 'heif', 'heic', 'avif', 'ico'];
+
   static isVideo(name: string): boolean {
     const idx = name.lastIndexOf('.');
     if (idx < 0 || idx === name.length - 1) {
@@ -9,6 +12,15 @@ export class MediaUtil {
     }
     const ext = name.substring(idx + 1).toLowerCase();
     return MediaUtil.VIDEO_EXTS.indexOf(ext) >= 0;
+  }
+
+  static isImage(name: string): boolean {
+    const idx = name.lastIndexOf('.');
+    if (idx < 0 || idx === name.length - 1) {
+      return false;
+    }
+    const ext = name.substring(idx + 1).toLowerCase();
+    return MediaUtil.IMAGE_EXTS.indexOf(ext) >= 0;
   }
 
   static contentType(path: string): string {
