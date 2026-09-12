@@ -10,6 +10,8 @@ export class SmbCommand {
   static readonly CREATE = 0x0005;
   static readonly CLOSE = 0x0006;
   static readonly READ = 0x0008;
+  static readonly WRITE = 0x0009;
+  static readonly SET_INFO = 0x000b;
   static readonly QUERY_DIRECTORY = 0x000e;
 }
 
@@ -25,6 +27,12 @@ export class SmbStatus {
   static readonly OBJECT_NAME_NOT_FOUND = 0xc0000034;
   static readonly OBJECT_PATH_NOT_FOUND = 0xc000003a;
   static readonly INVALID_PARAMETER = 0xc000000d;
+  static readonly SHARING_VIOLATION = 0xc0000043;
+  static readonly FILE_IS_A_DIRECTORY = 0xc00000ba;
+  static readonly DIRECTORY_NOT_EMPTY = 0xc0000101;
+  static readonly NOT_A_DIRECTORY = 0xc0000103;
+  static readonly CANNOT_DELETE = 0xc0000121;
+  static readonly NOT_SUPPORTED = 0xc00000bb;
 
   static describe(status: number): string {
     if (status === SmbStatus.LOGON_FAILURE) {
@@ -41,6 +49,21 @@ export class SmbStatus {
     }
     if (status === SmbStatus.INVALID_PARAMETER) {
       return '服务器拒绝请求（可能不支持 SMB3.1.1）';
+    }
+    if (status === SmbStatus.SHARING_VIOLATION) {
+      return '文件正被占用，无法删除';
+    }
+    if (status === SmbStatus.DIRECTORY_NOT_EMPTY) {
+      return '文件夹不为空，无法删除';
+    }
+    if (status === SmbStatus.CANNOT_DELETE) {
+      return '文件为只读或被占用，无法删除';
+    }
+    if (status === SmbStatus.FILE_IS_A_DIRECTORY) {
+      return '目标是一个文件夹';
+    }
+    if (status === SmbStatus.NOT_A_DIRECTORY) {
+      return '目标不是文件夹';
     }
     if (status === 0xc0000072) {
       return '账户已被禁用';
@@ -451,8 +474,33 @@ export class SmbPacket {
     return SmbPacket.createReqWithAccess(pipeName, false, 0x00120183, false);
   }
 
+  /** 删除用打开：DesiredAccess 必须包含 DELETE(0x00010000) 才能设置删除标记 */
+  static createDeleteReq(fileName: string, isDirectory: boolean): Uint8Array {
+    return SmbPacket.createReqWithAccess(fileName, isDirectory, 0x00010000, !isDirectory);
+  }
+
+  /** 删除用打开（FILE_DELETE_ON_CLOSE）：CLOSE 句柄时由服务端执行删除 */
+  static createDeleteOnCloseReq(fileName: string, isDirectory: boolean): Uint8Array {
+    return SmbPacket.createReqWithAccess(fileName, isDirectory, 0x00010000, !isDirectory, 0x00001000);
+  }
+
+  /** SET_INFO / FileDispositionInformation(13)：DeletePending=1，配合 CLOSE 完成删除 */
+  static setInfoDispositionReq(fileId: Uint8Array): Uint8Array {
+    const w = new ByteWriter(33);
+    w.u16le(33);
+    w.u8(1);      // InfoType: SMB2_0_INFO_FILE
+    w.u8(13);     // FileInformationClass: FileDispositionInformation
+    w.u32le(1);   // BufferLength
+    w.u16le(96);  // BufferOffset = SMB2 header(64) + 32
+    w.u16le(0);   // Reserved
+    w.u32le(0);   // AdditionalInformation
+    w.bytes(fileId);
+    w.u8(1);      // DeletePending = true
+    return w.finish();
+  }
+
   private static createReqWithAccess(fileName: string, isDirectory: boolean, accessMask: number,
-    nonDirectory: boolean): Uint8Array {
+    nonDirectory: boolean, extraOptions: number = 0): Uint8Array {
     const name = SmbCrypto.utf16leEncode(fileName);
     const bufLen = name.length === 0 ? 1 : name.length;
     const w = new ByteWriter(56 + bufLen);
@@ -468,7 +516,7 @@ export class SmbPacket {
     w.u32le(0x1);
     // CreateOptions：目录必须 FILE_DIRECTORY_FILE(0x01)；文件必须 FILE_NON_DIRECTORY_FILE(0x40)。
     // 否则服务端会把带点的目录当普通文件打开成功，导致目录被识别成文件而无法进入。
-    w.u32le(isDirectory ? 0x00000001 : (nonDirectory ? 0x00000040 : 0));
+    w.u32le((isDirectory ? 0x00000001 : (nonDirectory ? 0x00000040 : 0)) | extraOptions);
     w.u16le(120);
     w.u16le(name.length);
     w.u32le(0);

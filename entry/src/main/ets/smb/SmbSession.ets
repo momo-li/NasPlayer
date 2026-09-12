@@ -180,6 +180,31 @@ export class SmbSession {
     return this.client.readRange(relPath, offset, length);
   }
 
+  async delete(relPath: string, isDirectory: boolean): Promise<void> {
+    try {
+      await this.deleteOnce(relPath, isDirectory);
+    } catch (e) {
+      if (SmbSession.isNetworkError(e) && this.config !== undefined) {
+        hilog.warn(DOMAIN, TAG, 'delete network error, reconnect and retry');
+        await this.reconnect();
+        await this.deleteOnce(relPath, isDirectory);
+        return;
+      }
+      throw e as Error;
+    }
+  }
+
+  private async deleteOnce(relPath: string, isDirectory: boolean): Promise<void> {
+    const pending = this.reconnecting;
+    if (pending !== undefined) {
+      await pending;
+    }
+    if (this.client === undefined) {
+      throw new Error('未连接');
+    }
+    await this.client.deleteEntry(relPath, isDirectory);
+  }
+
   private static isNetworkError(e: Error): boolean {
     const msg = e.message;
     return msg.indexOf('Network') >= 0 || msg.indexOf('socket') >= 0 || msg.indexOf('closed') >= 0 ||

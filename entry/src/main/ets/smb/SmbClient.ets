@@ -587,6 +587,65 @@ export class SmbClient {
     return f.endOfFile;
   }
 
+  /** 删除文件/空文件夹：优先 FILE_DELETE_ON_CLOSE，服务端不支持时回退 SET_INFO 删除标记 */
+  async deleteEntry(relPath: string, isDirectory: boolean): Promise<void> {
+    let info: CreateInfo | undefined = undefined;
+    try {
+      info = await this.createRaw(SmbPacket.createDeleteOnCloseReq(relPath, isDirectory));
+    } catch (e) {
+      info = undefined;
+      if (!SmbClient.isUnsupportedDeleteError(e)) {
+        throw e as Error;
+      }
+      hilog.warn(DOMAIN, TAG, 'delete on close rejected, fallback to setinfo: %{public}s',
+        JSON.stringify(e));
+    }
+    if (info !== undefined) {
+      await this.closeFileStrict(info.fileId);
+      hilog.info(DOMAIN, TAG, 'delete ok(delete-on-close) path=%{public}s dir=%{public}s',
+        relPath, String(isDirectory));
+      this.dirCache.clear();
+      return;
+    }
+    const f = await this.createRaw(SmbPacket.createDeleteReq(relPath, isDirectory));
+    try {
+      await this.setDeletePending(f.fileId);
+    } catch (e) {
+      // SET_INFO 失败：关闭句柄后透出原始错误
+      await this.closeFile(f.fileId);
+      throw e as Error;
+    }
+    await this.closeFileStrict(f.fileId);
+    hilog.info(DOMAIN, TAG, 'delete ok(setinfo) path=%{public}s dir=%{public}s',
+      relPath, String(isDirectory));
+    this.dirCache.clear();
+  }
+
+  private static isUnsupportedDeleteError(e: Object): boolean {
+    if (e instanceof SmbError) {
+      return e.status === SmbStatus.INVALID_PARAMETER || e.status === SmbStatus.NOT_SUPPORTED;
+    }
+    return false;
+  }
+
+  private async setDeletePending(fileId: Uint8Array): Promise<void> {
+    const resp = await this.sendRequest(SmbCommand.SET_INFO,
+      SmbPacket.setInfoDispositionReq(fileId), true, true, true, false, false);
+    const hdr = SmbPacket.parseHeader(resp);
+    if (hdr.status !== SmbStatus.SUCCESS) {
+      throw new SmbError(hdr.status, '[SET_INFO] ' + SmbStatus.describe(hdr.status));
+    }
+  }
+
+  private async closeFileStrict(fileId: Uint8Array): Promise<void> {
+    const resp = await this.sendRequest(SmbCommand.CLOSE, SmbPacket.closeReq(fileId),
+      true, true, true, false, false);
+    const hdr = SmbPacket.parseHeader(resp);
+    if (hdr.status !== SmbStatus.SUCCESS) {
+      throw new SmbError(hdr.status, '[CLOSE] ' + SmbStatus.describe(hdr.status));
+    }
+  }
+
   async readRange(relPath: string, offset: number, length: number): Promise<Uint8Array> {
     if (length <= 0) {
       return new Uint8Array(0);
@@ -708,5 +767,6 @@ class SmbCommand {
   static readonly CLOSE = 0x0006;
   static readonly READ = 0x0008;
   static readonly WRITE = 0x0009;
+  static readonly SET_INFO = 0x000b;
   static readonly QUERY_DIRECTORY = 0x000e;
 }

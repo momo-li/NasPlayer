@@ -56,6 +56,10 @@ export class SmbService {
     return this.session.readRange(relPath, offset, length);
   }
 
+  async deleteEntry(relPath: string, isDirectory: boolean): Promise<void> {
+    await this.session.delete(relPath, isDirectory);
+  }
+
   async disconnect(): Promise<void> {
     await this.session.disconnect();
   }
