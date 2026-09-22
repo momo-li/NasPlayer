@@ -16,6 +16,8 @@ const DOMAIN = 0x0000;
 const TAG = 'NasPlayer';
 const SESSION_TAG = 'NasPlayer-Audio';
 const SESSION_SYNC_INTERVAL_MS = 1000;
+/** 起播后延迟多久预读相邻曲目元数据：太早会和刚起播的流抢带宽 */
+const NEIGHBOR_PREFETCH_DELAY_MS = 2000;
 
 @Component
 export default struct AudioPlayerPage {
@@ -28,6 +30,7 @@ export default struct AudioPlayerPage {
   private destroyed: boolean = false;
   private lastSessionSync: number = 0;
   private launchAgent: WantAgent | undefined = undefined;
+  private metaPrefetchTimer: number = -1;
   @State loopMode: avSession.LoopMode = avSession.LoopMode.LOOP_MODE_SEQUENCE;
 
   @State tracks: VideoEntry[] = [];
@@ -152,7 +155,8 @@ export default struct AudioPlayerPage {
       } else {
         await player.reset();
       }
-      await this.withTimeout(StreamServer.getInstance().warmup(entry.path), 20000, '音频加载');
+      // 音频没有 moov 尾部，只等文件大小 + 最多 1.2s 头部预取，其余转后台，切换路径不再被预取拖住
+      await this.withTimeout(StreamServer.getInstance().warmup(entry.path, 1200, false), 20000, '音频加载');
       player.url = StreamServer.getInstance().urlFor(entry.path);
       const ready = await this.waitForState(player, 'initialized', 8000);
       if (!ready) {
@@ -171,6 +175,7 @@ export default struct AudioPlayerPage {
       this.ensureBackgroundTask();
       this.syncSessionState();
       this.syncSessionMetadata();
+      this.scheduleNeighborMetaPrefetch();
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'audio play failed: %{public}s serveErr=%{public}s',
         JSON.stringify(e), StreamServer.getInstance().getLastServeError());
@@ -591,6 +596,42 @@ export default struct AudioPlayerPage {
 
   // ---------------- 元数据 ----------------
 
+  /** 起播后延迟预读相邻曲目的元数据：弱网下切换时标题/封面直接命中缓存，不再等 SMB */
+  private scheduleNeighborMetaPrefetch(): void {
+    if (this.metaPrefetchTimer >= 0) {
+      clearTimeout(this.metaPrefetchTimer);
+    }
+    this.metaPrefetchTimer = setTimeout(() => {
+      this.metaPrefetchTimer = -1;
+      this.prefetchNeighborMeta();
+    }, NEIGHBOR_PREFETCH_DELAY_MS);
+  }
+
+  /** 串行预读前后两首：先下一首，再上一首；用户中途切歌就让路，不抢占正在播放的带宽 */
+  private async prefetchNeighborMeta(): Promise<void> {
+    const paths: string[] = [];
+    const next = this.index + 1;
+    if (next >= 0 && next < this.tracks.length) {
+      paths.push(this.tracks[next].path);
+    }
+    const prev = this.index - 1;
+    if (prev >= 0 && prev < this.tracks.length) {
+      paths.push(this.tracks[prev].path);
+    }
+    for (let i = 0; i < paths.length; i++) {
+      if (this.destroyed || this.switchInProgress) {
+        return;
+      }
+      const path = paths[i];
+      try {
+        await AudioMetaUtil.getInstance().get(path);
+        hilog.info(DOMAIN, TAG, 'neighbor meta prefetched path=%{public}s', path);
+      } catch (e) {
+        hilog.debug(DOMAIN, TAG, 'neighbor meta prefetch failed: %{public}s', JSON.stringify(e));
+      }
+    }
+  }
+
   private async loadMeta(entry: VideoEntry): Promise<void> {
     this.titleText = entry.name;
     this.artistText = '';
@@ -802,6 +843,10 @@ export default struct AudioPlayerPage {
   }
 
   private async releaseAll(): Promise<void> {
+    if (this.metaPrefetchTimer >= 0) {
+      clearTimeout(this.metaPrefetchTimer);
+      this.metaPrefetchTimer = -1;
+    }
     await this.stopBackgroundTask();
     const s = this.session;
     this.session = undefined;

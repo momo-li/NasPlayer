@@ -42,7 +42,12 @@ export class StreamServer {
   private rangeCache: Map<string, CacheBlock[]> = new Map<string, CacheBlock[]>();
   private cacheQueue: string[] = [];
   private cacheBytes: number = 0;
-  private prefetched: Map<string, boolean> = new Map<string, boolean>();
+  private headPrefetched: Map<string, boolean> = new Map<string, boolean>();
+  private tailPrefetched: Map<string, boolean> = new Map<string, boolean>();
+  private prefetchTasks: Map<string, Promise<void>> = new Map<string, Promise<void>>();
+  private prefetchQueue: string[] = [];
+  private prefetchTail: Map<string, boolean> = new Map<string, boolean>();
+  private prefetchBusy: boolean = false;
 
   static getInstance(): StreamServer {
     return StreamServer.instance;
@@ -132,29 +137,135 @@ export class StreamServer {
     await this.start();
   }
 
-  /** 预热：确保 SMB 连接就绪、缓存文件大小，并预取头部与尾部（moov）。
-   *  远端链路较慢时，预取耗时数秒，但可让 AVPlayer 首次起播的 Range 请求全部命中内存。 */
-  async warmup(relPath: string): Promise<number> {
-    let size = this.sizeCache.get(relPath);
-    if (size === undefined) {
-      size = await SmbService.getInstance().getSize(relPath);
-      this.sizeCache.set(relPath, size);
+  /** 预热：只等文件大小（一次 CREATE，很快），头/尾预取转后台，不再阻塞起播。
+   *  waitHeadMs 表示最多为“头部就绪”等多久：快链路通常能命中缓存，慢链路上宁可先起播、
+   *  缺的数据由 streamRange 的 cache miss 分支按需读 SMB，避免把几 MB 预取压在切换路径上。
+   *  withTail=false 用于音频（没有 moov 尾部，预取尾部纯属浪费带宽）。 */
+  async warmup(relPath: string, waitHeadMs: number = 0, withTail: boolean = true): Promise<number> {
+    const size = await this.ensureSize(relPath);
+    const task = this.ensurePrefetch(relPath, size, withTail);
+    if (waitHeadMs > 0) {
+      await StreamServer.raceTimeout(task, waitHeadMs);
     }
-    if (this.prefetched.get(relPath) !== true) {
-      this.prefetched.set(relPath, true);
+    return size;
+  }
+
+  /** 外部已读到的文件头直接塞进缓存（图片/音频元数据解析读的就是头部），让首包无需二次读 SMB */
+  cacheHead(relPath: string, data: Uint8Array): void {
+    if (data.length === 0 || this.rangeCache.get(relPath) !== undefined) {
+      return;
+    }
+    this.cachePut(relPath, 0, data);
+  }
+
+  /** 相邻条目后台预热：串行执行，避免多个预取同时抢走正在播放的带宽 */
+  prefetch(relPath: string, withTail: boolean = true): void {
+    if (relPath.length === 0) {
+      return;
+    }
+    const headDone = this.headPrefetched.get(relPath) === true;
+    const tailDone = this.tailPrefetched.get(relPath) === true;
+    if (headDone && (!withTail || tailDone)) {
+      return;
+    }
+    if (this.prefetchQueue.indexOf(relPath) >= 0) {
+      return;
+    }
+    this.prefetchQueue.push(relPath);
+    this.prefetchTail.set(relPath, withTail);
+    this.drainPrefetchQueue();
+  }
+
+  private drainPrefetchQueue(): void {
+    if (this.prefetchBusy) {
+      return;
+    }
+    const next = this.prefetchQueue.shift();
+    if (next === undefined) {
+      return;
+    }
+    const tail = this.prefetchTail.get(next) !== false;
+    this.prefetchTail.delete(next);
+    this.prefetchBusy = true;
+    this.prefetchFull(next, tail).then(() => {
+      this.prefetchBusy = false;
+      this.drainPrefetchQueue();
+    }).catch((e: Error) => {
+      hilog.debug(DOMAIN, TAG, 'prefetch failed path=%{public}s err=%{public}s', next, e.message);
+      this.prefetchBusy = false;
+      this.drainPrefetchQueue();
+    });
+  }
+
+  private async prefetchFull(relPath: string, withTail: boolean): Promise<void> {
+    const size = await this.ensureSize(relPath);
+    await this.ensurePrefetch(relPath, size, withTail);
+  }
+
+  private async ensureSize(relPath: string): Promise<number> {
+    const cached = this.sizeCache.get(relPath);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const size = await SmbService.getInstance().getSize(relPath);
+    this.sizeCache.set(relPath, size);
+    return size;
+  }
+
+  /** 每个文件的头/尾各只跑一次：已在跑就复用同一 Promise，已跑过就直接返回 */
+  private ensurePrefetch(relPath: string, size: number, withTail: boolean): Promise<void> {
+    const running = this.prefetchTasks.get(relPath);
+    if (running !== undefined) {
+      return running;
+    }
+    const needHead = this.headPrefetched.get(relPath) !== true;
+    const needTail = withTail && this.tailPrefetched.get(relPath) !== true;
+    if (!needHead && !needTail) {
+      return Promise.resolve();
+    }
+    if (needHead) {
+      this.headPrefetched.set(relPath, true);
+    }
+    if (needTail) {
+      this.tailPrefetched.set(relPath, true);
+    }
+    const task = this.prefetchSegments(relPath, size, needHead, needTail);
+    this.prefetchTasks.set(relPath, task);
+    task.then(() => {
+      this.prefetchTasks.delete(relPath);
+    }).catch((e: Error) => {
+      this.prefetchTasks.delete(relPath);
+      hilog.debug(DOMAIN, TAG, 'prefetch task failed path=%{public}s err=%{public}s', relPath, e.message);
+    });
+    return task;
+  }
+
+  private async prefetchSegments(relPath: string, size: number, head: boolean, tail: boolean): Promise<void> {
+    if (head) {
       try {
         await this.prefetchRange(relPath, 0, Math.min(PREFETCH_HEAD, size));
       } catch (e) {
         hilog.warn(DOMAIN, TAG, 'prefetch head failed: %{public}s', JSON.stringify(e));
       }
-      try {
-        const tailLen = Math.min(PREFETCH_TAIL, size);
-        await this.prefetchRange(relPath, Math.max(0, size - tailLen), tailLen);
-      } catch (e) {
-        hilog.warn(DOMAIN, TAG, 'prefetch tail failed: %{public}s', JSON.stringify(e));
-      }
     }
-    return size;
+    if (!tail) {
+      return;
+    }
+    try {
+      const tailLen = Math.min(PREFETCH_TAIL, size);
+      await this.prefetchRange(relPath, Math.max(0, size - tailLen), tailLen);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'prefetch tail failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  /** 到点就放行：慢链路上不为预取干等 */
+  private static raceTimeout(task: Promise<void>, ms: number): Promise<void> {
+    return Promise.race([task, new Promise<void>((resolve) => {
+      setTimeout(() => {
+        resolve();
+      }, ms);
+    })]);
   }
 
   private async prefetchRange(relPath: string, start: number, len: number): Promise<void> {
@@ -215,7 +326,12 @@ export class StreamServer {
     this.rangeCache.clear();
     this.cacheQueue = [];
     this.cacheBytes = 0;
-    this.prefetched.clear();
+    this.headPrefetched.clear();
+    this.tailPrefetched.clear();
+    this.prefetchTasks.clear();
+    this.prefetchQueue = [];
+    this.prefetchTail.clear();
+    this.prefetchBusy = false;
   }
 
   async stop(): Promise<void> {

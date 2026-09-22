@@ -9,6 +9,9 @@ import { PlayerParams } from '../model/RouteParams';
 import { StreamServer } from '../service/StreamServer';
 import { MediaUtil } from '../service/MediaUtil';
 
+/** 起播后延迟多久开始预热相邻视频：太早会和刚起播的流抢带宽，太晚则来不及 */
+const NEIGHBOR_PREFETCH_DELAY_MS = 2500;
+
 @Component
 export default struct PlayerPage {
   params: PlayerParams = { files: [], index: 0 };
@@ -22,6 +25,7 @@ export default struct PlayerPage {
   private destroyed: boolean = false;
   @State isLandscape: boolean = false;
   private resumePosition: number = 0;
+  private prefetchTimer: number = -1;
   @State holdX2Tip: boolean = false;
 
   @State videoFiles: VideoEntry[] = [];
@@ -297,6 +301,10 @@ export default struct PlayerPage {
       clearTimeout(this.hideTimer);
       this.hideTimer = -1;
     }
+    if (this.prefetchTimer >= 0) {
+      clearTimeout(this.prefetchTimer);
+      this.prefetchTimer = -1;
+    }
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const win = ctx.windowStage.getMainWindowSync();
@@ -423,10 +431,9 @@ export default struct PlayerPage {
       if (this.surfaceId.length === 0) {
         throw new Error('视频 surface 未就绪');
       }
-      // 预热：提前确保 SMB 连接就绪并缓存文件头/尾（moov）。远端链路较慢时需要数秒，
-      // 但可以让 AVPlayer 首次起播就成功，避免反复失败重试。
-      // 预热失败直接抛出，快速进入重试，避免在 AVPlayer 阶段白等
-      await this.withTimeout(StreamServer.getInstance().warmup(entry.path), 20000, '视频信息加载');
+      // 预热只等文件大小 + 最多 1.5s 的头部预取：几 MB 的头/尾预取转后台，
+      // 不再把完整预取耗时压在切换路径上（弱网下这是切换慢的主因）
+      await this.withTimeout(StreamServer.getInstance().warmup(entry.path, 1500), 20000, '视频信息加载');
       const url = StreamServer.getInstance().urlFor(entry.path);
       player.url = url;
       hilog.info(0x0000, 'NasPlayer', 'playEntry: url set, state=%{public}s', player.state);
@@ -458,6 +465,7 @@ export default struct PlayerPage {
       this.playing = true;
       this.errorMsg = '';
       this.loading = false;
+      this.scheduleNeighborPrefetch();
     } catch (e) {
       console.error('play failed: ' + JSON.stringify(e));
       hilog.error(0x0000, 'NasPlayer', 'playEntry failed: %{public}s serveErr=%{public}s',
@@ -480,6 +488,12 @@ export default struct PlayerPage {
             r();
           }, 500);
         });
+        // 重试前把（后台还在跑的）头/尾预取等完：第二次尝试的 Range 请求大概率直接命中内存
+        try {
+          await this.withTimeout(StreamServer.getInstance().warmup(entry.path, 6000), 8000, '视频预取');
+        } catch (e3) {
+          hilog.warn(0x0000, 'NasPlayer', 'retry wait prefetch failed: %{public}s', JSON.stringify(e3));
+        }
         await this.playEntry(entry, retryCount + 1);
         return;
       }
@@ -630,6 +644,29 @@ export default struct PlayerPage {
     this.updateScale();
     this.applyFullscreenState();
     this.showControlsTemporarily();
+  }
+
+  /** 起播后延迟预热相邻视频（先下一部再上一部）：弱网下上下切换时数据已在内存，接近秒开。
+   *  只预取头部 1MB：尾部 4MB 会让后台流量挤占正在播放的带宽，弱网下反而更卡。 */
+  private scheduleNeighborPrefetch(): void {
+    if (this.prefetchTimer >= 0) {
+      clearTimeout(this.prefetchTimer);
+    }
+    this.prefetchTimer = setTimeout(() => {
+      this.prefetchTimer = -1;
+      if (this.destroyed) {
+        return;
+      }
+      const server = StreamServer.getInstance();
+      const next = this.index + 1;
+      if (next >= 0 && next < this.videoFiles.length) {
+        server.prefetch(this.videoFiles[next].path, false);
+      }
+      const prev = this.index - 1;
+      if (prev >= 0 && prev < this.videoFiles.length) {
+        server.prefetch(this.videoFiles[prev].path, false);
+      }
+    }, NEIGHBOR_PREFETCH_DELAY_MS);
   }
 
   private async switchTo(delta: number): Promise<void> {
