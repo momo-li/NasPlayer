@@ -2,6 +2,18 @@ import { SmbCrypto } from './SmbCrypto';
 
 export const SMB2_HEADER_LEN = 64;
 
+/** QUERY_DIRECTORY 的 FileInformationClass：前者只给文件名，后者带属性/大小/时间，可省掉逐项 CREATE 探测 */
+export const DIR_INFO_NAMES = 0x0c;
+export const DIR_INFO_BOTH_DIR = 0x03;
+/** FILE_BOTH_DIR_INFORMATION 中 FileName 之前的固定长度 */
+export const DIR_BOTH_DIR_FIXED = 94;
+/** FILE_ATTRIBUTE_DIRECTORY */
+export const FILE_ATTRIBUTE_DIRECTORY = 0x10;
+/** 目录枚举请求的输出缓冲下限（SMB2 保证值），实际取服务端 MaxTransactSize 与上限的较小值 */
+export const DIR_QUERY_DEFAULT_BUF = 65536;
+/** 目录枚举输出缓冲上限 */
+export const DIR_QUERY_MAX_BUF = 1048576;
+
 export class SmbCommand {
   static readonly NEGOTIATE = 0x0000;
   static readonly SESSION_SETUP = 0x0001;
@@ -372,13 +384,14 @@ export class SmbPacket {
     const info: NegotiateInfo = {
       securityMode: securityMode,
       dialectRevision: dialectRevision,
-      maxReadSize: 0
+      maxReadSize: 0,
+      maxTransactSize: 0
     };
     if (r.remaining() >= 44) {
       r.bytes(2);
       r.bytes(16);
       r.u32le();
-      r.u32le();
+      info.maxTransactSize = r.u32le();
       info.maxReadSize = r.u32le();
       r.u32le();
     }
@@ -587,22 +600,23 @@ export class SmbPacket {
     return info;
   }
 
-  static queryDirectoryReq(fileId: Uint8Array, restart: boolean): Uint8Array {
+  static queryDirectoryReq(fileId: Uint8Array, restart: boolean, infoClass: number,
+    outputLen: number = DIR_QUERY_DEFAULT_BUF): Uint8Array {
     const pattern = SmbCrypto.utf16leEncode('*');
     const w = new ByteWriter(32 + pattern.length);
     w.u16le(33);
-    w.u8(0x0c);
+    w.u8(infoClass);
     w.u8(restart ? 0x01 : 0x00);
     w.u32le(0);
     w.bytes(fileId);
     w.u16le(96);
     w.u16le(pattern.length);
-    w.u32le(65536);
+    w.u32le(outputLen);
     w.bytes(pattern);
     return w.finish();
   }
 
-  static parseQueryDirectoryResp(body: Uint8Array): QueryEntry[] {
+  static parseQueryDirectoryResp(body: Uint8Array, infoClass: number): QueryEntry[] {
     const r = new ByteReader(body);
     r.u16le();
     const off = r.u16le();
@@ -610,6 +624,40 @@ export class SmbPacket {
     const data = body.slice(off - SMB2_HEADER_LEN, off - SMB2_HEADER_LEN + len);
     const entries: QueryEntry[] = [];
     const er = new ByteReader(data);
+    if (infoClass === DIR_INFO_BOTH_DIR) {
+      while (er.remaining() >= DIR_BOTH_DIR_FIXED) {
+        const next = er.u32le();
+        er.u32le();
+        er.u64le();
+        er.u64le();
+        const lastWriteTime = er.u64le();
+        er.u64le();
+        const endOfFile = er.u64le();
+        er.u64le();
+        const attrs = er.u32le();
+        const nameLen = er.u32le();
+        er.u32le();
+        er.u8();
+        er.u8();
+        er.bytes(24);
+        if (nameLen === 0 || er.remaining() < nameLen) {
+          break;
+        }
+        const entry: QueryEntry = {
+          name: SmbCrypto.utf16leDecode(er.bytes(nameLen)),
+          isDirectory: (attrs & FILE_ATTRIBUTE_DIRECTORY) !== 0,
+          size: endOfFile,
+          lastWriteTime: lastWriteTime,
+          fileAttributes: attrs
+        };
+        entries.push(entry);
+        if (next === 0 || er.remaining() < 4) {
+          break;
+        }
+        er.position = er.position + next - (DIR_BOTH_DIR_FIXED + nameLen);
+      }
+      return entries;
+    }
     while (er.remaining() >= 12) {
       const next = er.u32le();
       er.u32le();
@@ -622,7 +670,8 @@ export class SmbPacket {
         name: name,
         isDirectory: false,
         size: 0,
-        lastWriteTime: 0
+        lastWriteTime: 0,
+        fileAttributes: 0
       };
       entries.push(entry);
       if (next === 0 || er.remaining() < 4) {
@@ -853,6 +902,8 @@ export interface NegotiateInfo {
   securityMode: number;
   dialectRevision: number;
   maxReadSize: number;
+  /** 服务端可接受的最大单次传输长度，决定目录枚举每次能取回多少条目 */
+  maxTransactSize: number;
 }
 
 export interface CreateInfo {
@@ -866,4 +917,6 @@ export interface QueryEntry {
   isDirectory: boolean;
   size: number;
   lastWriteTime: number;
+  /** FILE_ATTRIBUTE_* 原始值；0 表示服务端未随目录枚举返回属性（需逐项 CREATE 探测兜底） */
+  fileAttributes: number;
 }

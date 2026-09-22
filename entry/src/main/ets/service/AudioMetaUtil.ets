@@ -2,6 +2,7 @@ import { image } from '@kit.ImageKit';
 import { media } from '@kit.MediaKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SmbService } from './SmbService';
+import { LyricsUtil } from './LyricsUtil';
 
 const DOMAIN = 0x0000;
 const TAG = 'NasPlayer';
@@ -14,6 +15,8 @@ export class AudioMeta {
   artist: string = '';
   album: string = '';
   cover: image.PixelMap | undefined = undefined;
+  /** 内嵌歌词原文（ID3v2 USLT / FLAC Vorbis LYRICS）；侧车 .lrc 优先，这里只做兜底 */
+  lyricText: string = '';
 
   static of(title: string, artist: string, album: string, cover: image.PixelMap | undefined): AudioMeta {
     const m = new AudioMeta();
@@ -101,7 +104,10 @@ export class AudioMetaUtil {
       }
       hilog.info(DOMAIN, TAG, 'audio meta ok path=%{public}s title=%{public}s artist=%{public}s cover=%{public}s',
         path, title, artist, String(cover !== undefined));
-      return AudioMeta.of(title, artist, album, cover);
+      const meta = AudioMeta.of(title, artist, album, cover);
+      // 复用已预读的文件头解析内嵌歌词，避免为歌词再走一次 SMB 读取
+      meta.lyricText = LyricsUtil.extractEmbeddedLyric(data);
+      return meta;
     } finally {
       try {
         await extractor.release();
