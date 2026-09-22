@@ -48,6 +48,8 @@ export class StreamServer {
   private prefetchQueue: string[] = [];
   private prefetchTail: Map<string, boolean> = new Map<string, boolean>();
   private prefetchBusy: boolean = false;
+  /** 最近一次被请求流式播放的路径：缓存淘汰时保护它 */
+  private activePath: string = '';
 
   static getInstance(): StreamServer {
     return StreamServer.instance;
@@ -160,20 +162,45 @@ export class StreamServer {
 
   /** 相邻条目后台预热：串行执行，避免多个预取同时抢走正在播放的带宽 */
   prefetch(relPath: string, withTail: boolean = true): void {
+    if (this.enqueuePrefetch(relPath, withTail)) {
+      this.drainPrefetchQueue();
+    }
+  }
+
+  /**
+   * 重建预取窗口：丢弃已不在窗口内的待办，再按传入顺序（由近到远）重新排队。
+   * 每次切歌都调用一次，这样快速连滑时预取始终跟着当前位置走，不会去补早被划过的条目。
+   */
+  setPrefetchWindow(paths: string[], withTail: boolean = false): void {
+    this.prefetchQueue = [];
+    this.prefetchTail.clear();
+    let queued = false;
+    for (let i = 0; i < paths.length; i++) {
+      if (this.enqueuePrefetch(paths[i], withTail)) {
+        queued = true;
+      }
+    }
+    if (queued) {
+      this.drainPrefetchQueue();
+    }
+  }
+
+  /** 入队（去重 + 跳过已预取过的）：返回是否真的入队 */
+  private enqueuePrefetch(relPath: string, withTail: boolean): boolean {
     if (relPath.length === 0) {
-      return;
+      return false;
     }
     const headDone = this.headPrefetched.get(relPath) === true;
     const tailDone = this.tailPrefetched.get(relPath) === true;
     if (headDone && (!withTail || tailDone)) {
-      return;
+      return false;
     }
     if (this.prefetchQueue.indexOf(relPath) >= 0) {
-      return;
+      return false;
     }
     this.prefetchQueue.push(relPath);
     this.prefetchTail.set(relPath, withTail);
-    this.drainPrefetchQueue();
+    return true;
   }
 
   private drainPrefetchQueue(): void {
@@ -290,18 +317,29 @@ export class StreamServer {
     if (this.cacheQueue.indexOf(relPath) < 0) {
       this.cacheQueue.push(relPath);
     }
+    // 淘汰时永远跳过“正在播放的文件”：窗口预取会写入大量缓存，不能把当前内容挤出去
     while (this.cacheBytes > CACHE_LIMIT && this.cacheQueue.length > 1) {
-      const oldest = this.cacheQueue.shift();
-      if (oldest === undefined) {
+      let victim = '';
+      for (let i = 0; i < this.cacheQueue.length; i++) {
+        if (this.cacheQueue[i] !== this.activePath) {
+          victim = this.cacheQueue[i];
+          break;
+        }
+      }
+      if (victim.length === 0) {
         break;
       }
-      const oldBlocks = this.rangeCache.get(oldest);
+      const victimIdx = this.cacheQueue.indexOf(victim);
+      if (victimIdx >= 0) {
+        this.cacheQueue.splice(victimIdx, 1);
+      }
+      const oldBlocks = this.rangeCache.get(victim);
       if (oldBlocks !== undefined) {
         for (let i = 0; i < oldBlocks.length; i++) {
           this.cacheBytes -= oldBlocks[i].data.length;
         }
-        this.rangeCache.delete(oldest);
       }
+      this.rangeCache.delete(victim);
     }
   }
 
@@ -332,6 +370,7 @@ export class StreamServer {
     this.prefetchQueue = [];
     this.prefetchTail.clear();
     this.prefetchBusy = false;
+    this.activePath = '';
   }
 
   async stop(): Promise<void> {
@@ -482,6 +521,7 @@ export class StreamServer {
         await StreamServer.sendText(conn, 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n');
         return;
       }
+      this.activePath = relPath;
       const size = await this.getCachedSize(relPath);
       hilog.info(DOMAIN, TAG, 'getSize ok size=%{public}d', size);
       const type = MediaUtil.contentType(relPath);

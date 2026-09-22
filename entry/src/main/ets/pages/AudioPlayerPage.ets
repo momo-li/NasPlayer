@@ -18,6 +18,9 @@ const SESSION_TAG = 'NasPlayer-Audio';
 const SESSION_SYNC_INTERVAL_MS = 1000;
 /** 起播后延迟多久预读相邻曲目元数据：太早会和刚起播的流抢带宽 */
 const NEIGHBOR_PREFETCH_DELAY_MS = 2000;
+/** 预读窗口：沿最近一次切歌方向预读 5 首，反方向保底 1 首（单首仅约 256KB，顺带把流首包也放进缓存） */
+const PREFETCH_FORWARD = 5;
+const PREFETCH_BACK = 1;
 
 @Component
 export default struct AudioPlayerPage {
@@ -31,6 +34,10 @@ export default struct AudioPlayerPage {
   private lastSessionSync: number = 0;
   private launchAgent: WantAgent | undefined = undefined;
   private metaPrefetchTimer: number = -1;
+  /** 最近一次切歌方向：+1 下一首 / -1 上一首，决定预读窗口往哪边倾斜 */
+  private switchDir: number = 1;
+  /** 预读轮次：切歌后旧轮次自动作废 */
+  private prefetchSeq: number = 0;
   @State loopMode: avSession.LoopMode = avSession.LoopMode.LOOP_MODE_SEQUENCE;
 
   @State tracks: VideoEntry[] = [];
@@ -369,6 +376,7 @@ export default struct AudioPlayerPage {
     }
     this.switchInProgress = true;
     try {
+      this.switchDir = delta >= 0 ? 1 : -1;
       this.index = next;
       await this.playTrack(this.tracks[next]);
     } finally {
@@ -410,6 +418,9 @@ export default struct AudioPlayerPage {
       return;
     }
     this.switchInProgress = true;
+    if (mode !== avSession.LoopMode.LOOP_MODE_SHUFFLE) {
+      this.switchDir = 1;
+    }
     this.index = next;
     this.playTrack(this.tracks[next]).finally(() => {
       this.switchInProgress = false;
@@ -607,19 +618,35 @@ export default struct AudioPlayerPage {
     }, NEIGHBOR_PREFETCH_DELAY_MS);
   }
 
-  /** 串行预读前后两首：先下一首，再上一首；用户中途切歌就让路，不抢占正在播放的带宽 */
-  private async prefetchNeighborMeta(): Promise<void> {
+  /** 预读窗口路径：先沿切歌方向由近到远，再补反方向，越界即止 */
+  private metaPrefetchPaths(): string[] {
     const paths: string[] = [];
-    const next = this.index + 1;
-    if (next >= 0 && next < this.tracks.length) {
-      paths.push(this.tracks[next].path);
+    const total = this.tracks.length;
+    const dir = this.switchDir >= 0 ? 1 : -1;
+    for (let k = 1; k <= PREFETCH_FORWARD; k++) {
+      const i = this.index + dir * k;
+      if (i < 0 || i >= total) {
+        break;
+      }
+      paths.push(this.tracks[i].path);
     }
-    const prev = this.index - 1;
-    if (prev >= 0 && prev < this.tracks.length) {
-      paths.push(this.tracks[prev].path);
+    for (let k = 1; k <= PREFETCH_BACK; k++) {
+      const i = this.index - dir * k;
+      if (i < 0 || i >= total) {
+        break;
+      }
+      paths.push(this.tracks[i].path);
     }
+    return paths;
+  }
+
+  /** 串行预读窗口内曲目；用户中途切歌（seq 变化）立刻让路，不抢占正在播放的带宽 */
+  private async prefetchNeighborMeta(): Promise<void> {
+    const seq = this.prefetchSeq + 1;
+    this.prefetchSeq = seq;
+    const paths = this.metaPrefetchPaths();
     for (let i = 0; i < paths.length; i++) {
-      if (this.destroyed || this.switchInProgress) {
+      if (this.destroyed || this.switchInProgress || this.prefetchSeq !== seq) {
         return;
       }
       const path = paths[i];

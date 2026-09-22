@@ -11,6 +11,9 @@ import { MediaUtil } from '../service/MediaUtil';
 
 /** 起播后延迟多久开始预热相邻视频：太早会和刚起播的流抢带宽，太晚则来不及 */
 const NEIGHBOR_PREFETCH_DELAY_MS = 2500;
+/** 预热窗口：沿最近一次滑动方向预取 5 部，反方向保底 1 部（快速连滑时不用等反向回补） */
+const PREFETCH_FORWARD = 5;
+const PREFETCH_BACK = 1;
 
 @Component
 export default struct PlayerPage {
@@ -26,6 +29,8 @@ export default struct PlayerPage {
   @State isLandscape: boolean = false;
   private resumePosition: number = 0;
   private prefetchTimer: number = -1;
+  /** 最近一次切换方向：+1 下一部 / -1 上一部，决定预取窗口往哪边倾斜 */
+  private switchDir: number = 1;
   @State holdX2Tip: boolean = false;
 
   @State videoFiles: VideoEntry[] = [];
@@ -646,8 +651,9 @@ export default struct PlayerPage {
     this.showControlsTemporarily();
   }
 
-  /** 起播后延迟预热相邻视频（先下一部再上一部）：弱网下上下切换时数据已在内存，接近秒开。
-   *  只预取头部 1MB：尾部 4MB 会让后台流量挤占正在播放的带宽，弱网下反而更卡。 */
+  /** 起播后延迟预热相邻视频：弱网下上下切换时数据已在内存，接近秒开。
+   *  只预取头部 1MB：尾部 4MB 会让后台流量挤占正在播放的带宽，弱网下反而更卡。
+   *  窗口随滑动方向自适应（前后各 5 部 + 反向 1 部），每次切歌重建队列，跟得上快速连滑。 */
   private scheduleNeighborPrefetch(): void {
     if (this.prefetchTimer >= 0) {
       clearTimeout(this.prefetchTimer);
@@ -657,16 +663,35 @@ export default struct PlayerPage {
       if (this.destroyed) {
         return;
       }
-      const server = StreamServer.getInstance();
-      const next = this.index + 1;
-      if (next >= 0 && next < this.videoFiles.length) {
-        server.prefetch(this.videoFiles[next].path, false);
+      if (this.loading) {
+        // 当前还没起播：让出带宽，稍后再试
+        this.scheduleNeighborPrefetch();
+        return;
       }
-      const prev = this.index - 1;
-      if (prev >= 0 && prev < this.videoFiles.length) {
-        server.prefetch(this.videoFiles[prev].path, false);
-      }
+      StreamServer.getInstance().setPrefetchWindow(this.prefetchWindowPaths(), false);
     }, NEIGHBOR_PREFETCH_DELAY_MS);
+  }
+
+  /** 预取窗口路径：先沿滑动方向由近到远，再补反方向，越界即止 */
+  private prefetchWindowPaths(): string[] {
+    const paths: string[] = [];
+    const total = this.videoFiles.length;
+    const dir = this.switchDir >= 0 ? 1 : -1;
+    for (let k = 1; k <= PREFETCH_FORWARD; k++) {
+      const i = this.index + dir * k;
+      if (i < 0 || i >= total) {
+        break;
+      }
+      paths.push(this.videoFiles[i].path);
+    }
+    for (let k = 1; k <= PREFETCH_BACK; k++) {
+      const i = this.index - dir * k;
+      if (i < 0 || i >= total) {
+        break;
+      }
+      paths.push(this.videoFiles[i].path);
+    }
+    return paths;
   }
 
   private async switchTo(delta: number): Promise<void> {
@@ -684,6 +709,7 @@ export default struct PlayerPage {
     }
     this.switchInProgress = true;
     try {
+      this.switchDir = delta >= 0 ? 1 : -1;
       this.index = next;
       await this.playEntry(this.videoFiles[next]);
     } finally {
