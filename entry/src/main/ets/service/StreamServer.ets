@@ -160,13 +160,6 @@ export class StreamServer {
     this.cachePut(relPath, 0, data);
   }
 
-  /** 相邻条目后台预热：串行执行，避免多个预取同时抢走正在播放的带宽 */
-  prefetch(relPath: string, withTail: boolean = true): void {
-    if (this.enqueuePrefetch(relPath, withTail)) {
-      this.drainPrefetchQueue();
-    }
-  }
-
   /**
    * 重建预取窗口：丢弃已不在窗口内的待办，再按传入顺序（由近到远）重新排队。
    * 每次切歌都调用一次，这样快速连滑时预取始终跟着当前位置走，不会去补早被划过的条目。

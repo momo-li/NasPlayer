@@ -1,10 +1,10 @@
 import { image } from '@kit.ImageKit';
-import { window } from '@kit.ArkUI';
+import { window, AnimatedDrawableDescriptor, AnimationOptions } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { VideoEntry } from '../model/VideoEntry';
 import { ImageViewerParams } from '../model/RouteParams';
-import { ImageLoader } from '../service/ImageLoader';
+import { ImageLoader, LoadedImage } from '../service/ImageLoader';
 
 const DOMAIN = 0x0000;
 const TAG = 'NasPlayer';
@@ -50,6 +50,7 @@ struct ImageCell {
   onZoomChange: (zoomed: boolean) => void = (zoomed: boolean) => {};
 
   @State pixelMap: image.PixelMap | undefined = undefined;
+  @State animated: AnimatedDrawableDescriptor | undefined = undefined;
   @State failed: boolean = false;
   @State errorText: string = '';
   @State zoomScale: number = 1;
@@ -81,16 +82,17 @@ struct ImageCell {
     this.failed = false;
     this.errorText = '';
     try {
-      const pm = await l.load(this.path);
+      const img = await l.load(this.path);
       if (!this.alive) {
         return;
       }
-      this.pixelMap = pm;
+      this.applyLoaded(img);
     } catch (e) {
       if (!this.alive) {
         return;
       }
       this.pixelMap = undefined;
+      this.animated = undefined;
       this.failed = true;
       this.errorText = e instanceof Error ? e.message : '图片加载失败';
       hilog.warn(DOMAIN, TAG, 'image cell load failed path=%{public}s err=%{public}s', this.path,
@@ -98,8 +100,29 @@ struct ImageCell {
     }
   }
 
+  /** 动图交给 AnimatedDrawableDescriptor 逐帧播放，静态图沿用 PixelMap */
+  private applyLoaded(img: LoadedImage): void {
+    if (img.animated && img.frames.length > 1) {
+      const opts: AnimationOptions = { iterations: -1, autoPlay: true };
+      if (img.durations.length === img.frames.length) {
+        let total = 0;
+        for (let i = 0; i < img.durations.length; i++) {
+          total += img.durations[i];
+        }
+        opts.duration = total;
+        opts.frameDurations = img.durations;
+      }
+      this.animated = new AnimatedDrawableDescriptor(img.frames, opts);
+      this.pixelMap = undefined;
+      return;
+    }
+    this.animated = undefined;
+    this.pixelMap = img.frames.length > 0 ? img.frames[0] : undefined;
+  }
+
   private retry(): void {
     this.pixelMap = undefined;
+    this.animated = undefined;
     this.failed = false;
     this.startLoad();
   }
@@ -165,7 +188,14 @@ struct ImageCell {
 
   @Builder
   imageContent() {
-    if (this.pixelMap !== undefined) {
+    if (this.animated !== undefined) {
+      Image(this.animated)
+        .objectFit(ImageFit.Contain)
+        .width('100%')
+        .height('100%')
+        .scale({ x: this.zoomScale, y: this.zoomScale })
+        .translate({ x: this.panX, y: this.panY })
+    } else if (this.pixelMap !== undefined) {
       Image(this.pixelMap)
         .objectFit(ImageFit.Contain)
         .width('100%')

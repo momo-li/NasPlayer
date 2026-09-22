@@ -38,8 +38,9 @@ interface DirCacheEntry {
   ts: number;
 }
 
-/** 目录列表缓存有效期：删除/重命名会主动清缓存，下拉刷新会强制重列，因此可以放长以减少反复进出目录的重列 */
-const DIR_CACHE_TTL_MS = 60000;
+/** 目录列表缓存有效期：删除/重命名会主动清缓存、下拉刷新会强制重列、切换共享会清空，因此可以放长
+ *  （只用于减少反复进出同一目录的重列，取 30s 兼顾“进得快”和“别太旧”） */
+const DIR_CACHE_TTL_MS = 30000;
 
 export class SmbClient {
   private socket: SmbSocket = new SmbSocket();
@@ -347,6 +348,12 @@ export class SmbClient {
       throw new SmbError(hdr.status, '[TREE_CONNECT(' + shareName + ')] ' + SmbStatus.describe(hdr.status));
     }
     this.treeId = hdr.treeId;
+    // 切换共享：目录缓存是以“共享内相对路径”为键的，跨共享会串数据（进另一个磁盘却是上一个磁盘的列表），必须清空
+    if (this.share !== shareName) {
+      this.dirCache.clear();
+      this.share = shareName;
+      hilog.info(DOMAIN, TAG, 'tree connect switched share=%{public}s, dir cache cleared', shareName);
+    }
   }
 
   private async openPipe(pipeName: string): Promise<Uint8Array> {
@@ -488,11 +495,15 @@ export class SmbClient {
   }
 
   async readdir(relPath: string, force: boolean = false): Promise<QueryEntry[]> {
+    const key = this.dirCacheKey(relPath);
     if (!force) {
-      const cached = this.dirCache.get(relPath);
+      const cached = this.dirCache.get(key);
       if (cached !== undefined && Date.now() - cached.ts < DIR_CACHE_TTL_MS) {
         return cached.entries;
       }
+    } else {
+      // 强制刷新：先删掉旧缓存，避免本次拉取失败后旧数据又被后续非强制读取命中
+      this.dirCache.delete(key);
     }
     const started = Date.now();
     let entries: QueryEntry[] = [];
@@ -528,10 +539,15 @@ export class SmbClient {
     if (needProbe) {
       await this.probeEntries(relPath, entries);
     }
-    this.dirCache.set(relPath, { entries: entries, ts: Date.now() });
+    this.dirCache.set(key, { entries: entries, ts: Date.now() });
     hilog.info(DOMAIN, TAG, 'readdir done path=%{public}s entries=%{public}d probe=%{public}s cost=%{public}dms',
       relPath, entries.length, String(needProbe), Date.now() - started);
     return entries;
+  }
+
+  /** 目录缓存键必须带共享名：relPath 是共享内相对路径，不同共享的同名路径不能互相命中 */
+  private dirCacheKey(relPath: string): string {
+    return this.share + '\u0001' + relPath;
   }
 
   /** 目录枚举每次的输出缓冲：取服务端 MaxTransactSize（超出会被判参数非法）与上限的较小值 */

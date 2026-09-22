@@ -134,13 +134,18 @@ export default struct BrowserPage {
     this.getUIContext().getPromptAction().showToast({ message: msg });
   }
 
-  async load(path: string, force: boolean = false): Promise<void> {
-    this.loading = true;
+  /** silent=true 用于下拉刷新/删除后刷新：不切到全屏“加载中”，保持列表与 Refresh 组件在场，
+   *  否则 Refresh 会在刷新过程中被销毁，既看不到刷新动画、也拿不到刷新手势的完整状态 */
+  async load(path: string, force: boolean = false, silent: boolean = false): Promise<void> {
+    if (!silent) {
+      this.loading = true;
+    }
+    // 先记下目标路径：这样失败后的重试/刷新仍指向同一个目录，而不是停留在上一次成功的路径
+    this.currentPath = path;
     this.errorText = '';
     this.emptyText = '';
     try {
       const list = await SmbService.getInstance().readdir(path, force);
-      this.currentPath = path;
       this.source.setData(list);
       if (list.length === 0) {
         this.emptyText = '目录为空';
@@ -310,7 +315,7 @@ export default struct BrowserPage {
       hilog.info(0x0000, 'NasPlayer', 'delete ok path=%{public}s', target.path);
       this.actionTarget = undefined;
       this.showToast('已删除：' + target.name);
-      await this.load(this.currentPath, true);
+      await this.load(this.currentPath, true, true);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       hilog.error(0x0000, 'NasPlayer', 'delete failed path=%{public}s err=%{public}s', target.path, msg);
@@ -368,7 +373,7 @@ export default struct BrowserPage {
       hilog.info(0x0000, 'NasPlayer', 'rename ok path=%{public}s newName=%{public}s', target.path, name);
       this.renameTarget = undefined;
       this.showToast('已重命名为：' + name);
-      await this.load(this.currentPath, true);
+      await this.load(this.currentPath, true, true);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       hilog.error(0x0000, 'NasPlayer', 'rename failed path=%{public}s err=%{public}s', target.path, msg);
@@ -405,17 +410,24 @@ export default struct BrowserPage {
                 .height(36)
                 .backgroundColor($r('app.color.theme_primary'))
                 .onClick(() => {
-                  this.load(this.currentPath);
+                  this.load(this.currentPath, true, true);
                 })
             }
             .width('100%')
             .height('100%')
             .justifyContent(FlexAlign.Center)
           } else if (this.emptyText.length > 0) {
-            Column() {
+            Column({ space: 10 }) {
               Text(this.emptyText)
                 .fontSize(14)
                 .fontColor($r('app.color.text_secondary'))
+              Button('刷新')
+                .fontSize(14)
+                .height(36)
+                .backgroundColor($r('app.color.theme_primary'))
+                .onClick(() => {
+                  this.load(this.currentPath, true, true);
+                })
             }
             .width('100%')
             .height('100%')
@@ -453,7 +465,7 @@ export default struct BrowserPage {
             }
             .onRefreshing(() => {
               this.refreshing = true;
-              this.load(this.currentPath, true).finally(() => {
+              this.load(this.currentPath, true, true).finally(() => {
                 this.refreshing = false;
               });
             })
