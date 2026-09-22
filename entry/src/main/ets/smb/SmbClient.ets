@@ -1,6 +1,7 @@
 import { SmbCrypto } from './SmbCrypto';
 import { SmbSocket } from './SmbSocket';
-import { SmbPacket, SmbStatus, CreateInfo, QueryEntry, NegotiateInfo, SmbHeader, RpcShareInfo } from './SmbPacket';
+import { SmbPacket, SmbStatus, CreateInfo, QueryEntry, NegotiateInfo, SmbHeader, RpcShareInfo,
+  DIR_INFO_BOTH_DIR, DIR_INFO_NAMES, DIR_QUERY_DEFAULT_BUF, DIR_QUERY_MAX_BUF } from './SmbPacket';
 import { Ntlm } from './Ntlm';
 import { ShareEntry } from '../model/ShareEntry';
 import { NetUtil } from '../service/NetUtil';
@@ -37,7 +38,8 @@ interface DirCacheEntry {
   ts: number;
 }
 
-const DIR_CACHE_TTL_MS = 5000;
+/** 目录列表缓存有效期：删除/重命名会主动清缓存，下拉刷新会强制重列，因此可以放长以减少反复进出目录的重列 */
+const DIR_CACHE_TTL_MS = 60000;
 
 export class SmbClient {
   private socket: SmbSocket = new SmbSocket();
@@ -67,7 +69,10 @@ export class SmbClient {
   private connected: boolean = false;
   private dirCache: Map<string, DirCacheEntry> = new Map<string, DirCacheEntry>();
   private serverMaxReadSize: number = 0;
+  private serverMaxTransactSize: number = 0;
   private static readChunkFallback: number = 0;
+  /** 服务端不接受大输出缓冲时置位，之后目录枚举统一用默认缓冲 */
+  private static dirBigBufferFailed: boolean = false;
   /** SET_INFO 兼容变体候选（见 SmbPacket.setInfoReq）与已确认可用变体 */
   private static SET_INFO_VARIANTS: number[] = [0, 1, 3, 2, 4];
   private static setInfoVariant: number = -1;
@@ -199,8 +204,9 @@ export class SmbClient {
     const info: NegotiateInfo = SmbPacket.parseNegotiateResp(SmbPacket.body(resp));
     this.dialectRevision = info.dialectRevision;
     this.serverMaxReadSize = info.maxReadSize;
-    hilog.info(DOMAIN, TAG, 'negotiated dialect=0x%{public}s maxReadSize=%{public}s',
-      this.dialectRevision.toString(16), String(this.serverMaxReadSize));
+    this.serverMaxTransactSize = info.maxTransactSize;
+    hilog.info(DOMAIN, TAG, 'negotiated dialect=0x%{public}s maxReadSize=%{public}s maxTransactSize=%{public}s',
+      this.dialectRevision.toString(16), String(this.serverMaxReadSize), String(this.serverMaxTransactSize));
   }
 
   private async sessionSetupStep1(): Promise<void> {
@@ -488,20 +494,73 @@ export class SmbClient {
         return cached.entries;
       }
     }
+    const started = Date.now();
+    let entries: QueryEntry[] = [];
+    let needProbe = false;
+    try {
+      // 优先用带属性的 FileBothDirectoryInformation：一次枚举即可拿到目录标志/大小/修改时间，
+      // 省掉“每个条目一次 CREATE 探测”的 O(n) 往返——这是大目录加载慢的主因
+      entries = await this.queryDirectory(relPath, DIR_INFO_BOTH_DIR, this.dirQueryBufferSize());
+      needProbe = entries.length > 0 && !SmbClient.hasFileAttributes(entries);
+      if (needProbe) {
+        hilog.warn(DOMAIN, TAG, 'dir info without attributes, fallback to per-entry probe');
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'dir info query failed: %{public}s', JSON.stringify(e));
+      let recovered = false;
+      if (this.dirQueryBufferSize() > DIR_QUERY_DEFAULT_BUF) {
+        // 可能是服务端不接受大输出缓冲：本次会话退回默认缓冲重试
+        SmbClient.dirBigBufferFailed = true;
+        try {
+          entries = await this.queryDirectory(relPath, DIR_INFO_BOTH_DIR, DIR_QUERY_DEFAULT_BUF);
+          recovered = true;
+        } catch (e2) {
+          hilog.warn(DOMAIN, TAG, 'dir info retry failed: %{public}s', JSON.stringify(e2));
+        }
+      }
+      if (!recovered) {
+        entries = await this.queryDirectory(relPath, DIR_INFO_NAMES, DIR_QUERY_DEFAULT_BUF);
+        needProbe = true;
+      } else {
+        needProbe = entries.length > 0 && !SmbClient.hasFileAttributes(entries);
+      }
+    }
+    if (needProbe) {
+      await this.probeEntries(relPath, entries);
+    }
+    this.dirCache.set(relPath, { entries: entries, ts: Date.now() });
+    hilog.info(DOMAIN, TAG, 'readdir done path=%{public}s entries=%{public}d probe=%{public}s cost=%{public}dms',
+      relPath, entries.length, String(needProbe), Date.now() - started);
+    return entries;
+  }
+
+  /** 目录枚举每次的输出缓冲：取服务端 MaxTransactSize（超出会被判参数非法）与上限的较小值 */
+  private dirQueryBufferSize(): number {
+    if (SmbClient.dirBigBufferFailed) {
+      return DIR_QUERY_DEFAULT_BUF;
+    }
+    const advertised = this.serverMaxTransactSize;
+    if (advertised <= DIR_QUERY_DEFAULT_BUF) {
+      return DIR_QUERY_DEFAULT_BUF;
+    }
+    return Math.min(advertised, DIR_QUERY_MAX_BUF);
+  }
+
+  private async queryDirectory(relPath: string, infoClass: number, outputLen: number): Promise<QueryEntry[]> {
     const dir = await this.create(relPath, true);
     const entries: QueryEntry[] = [];
     try {
       let done = false;
       let first = true;
       while (!done) {
-        const body = SmbPacket.queryDirectoryReq(dir.fileId, first);
+        const body = SmbPacket.queryDirectoryReq(dir.fileId, first, infoClass, outputLen);
         first = false;
         const resp = await this.sendRequest(SmbCommand.QUERY_DIRECTORY, body, true, true, true, false, false);
         const hdr = SmbPacket.parseHeader(resp);
         if (hdr.status === SmbStatus.NO_MORE_FILES) {
           done = true;
         } else if (hdr.status === SmbStatus.SUCCESS || hdr.status === SmbStatus.BUFFER_OVERFLOW) {
-          const batch = SmbPacket.parseQueryDirectoryResp(SmbPacket.body(resp));
+          const batch = SmbPacket.parseQueryDirectoryResp(SmbPacket.body(resp), infoClass);
           for (let i = 0; i < batch.length; i++) {
             entries.push(batch[i]);
           }
@@ -515,9 +574,17 @@ export class SmbClient {
     } finally {
       await this.closeFile(dir.fileId);
     }
-    await this.probeEntries(relPath, entries);
-    this.dirCache.set(relPath, { entries: entries, ts: Date.now() });
     return entries;
+  }
+
+  /** 目录枚举是否真的带回了文件属性（全 0 说明服务端忽略了请求，属性不可信） */
+  private static hasFileAttributes(entries: QueryEntry[]): boolean {
+    for (let i = 0; i < entries.length; i++) {
+      if (entries[i].fileAttributes !== 0) {
+        return true;
+      }
+    }
+    return false;
   }
 
   clearDirCache(): void {

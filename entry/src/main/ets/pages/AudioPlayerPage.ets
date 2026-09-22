@@ -10,11 +10,17 @@ import { AudioPlayerParams } from '../model/RouteParams';
 import { StreamServer } from '../service/StreamServer';
 import { AudioMeta, AudioMetaUtil } from '../service/AudioMetaUtil';
 import { MediaUtil } from '../service/MediaUtil';
+import { Lyrics, LyricLine, LyricsUtil } from '../service/LyricsUtil';
 
 const DOMAIN = 0x0000;
 const TAG = 'NasPlayer';
 const SESSION_TAG = 'NasPlayer-Audio';
 const SESSION_SYNC_INTERVAL_MS = 1000;
+/** 起播后延迟多久预读相邻曲目元数据：太早会和刚起播的流抢带宽 */
+const NEIGHBOR_PREFETCH_DELAY_MS = 2000;
+/** 预读窗口：沿最近一次切歌方向预读 5 首，反方向保底 1 首（单首仅约 256KB，顺带把流首包也放进缓存） */
+const PREFETCH_FORWARD = 5;
+const PREFETCH_BACK = 1;
 
 @Component
 export default struct AudioPlayerPage {
@@ -27,6 +33,11 @@ export default struct AudioPlayerPage {
   private destroyed: boolean = false;
   private lastSessionSync: number = 0;
   private launchAgent: WantAgent | undefined = undefined;
+  private metaPrefetchTimer: number = -1;
+  /** 最近一次切歌方向：+1 下一首 / -1 上一首，决定预读窗口往哪边倾斜 */
+  private switchDir: number = 1;
+  /** 预读轮次：切歌后旧轮次自动作废 */
+  private prefetchSeq: number = 0;
   @State loopMode: avSession.LoopMode = avSession.LoopMode.LOOP_MODE_SEQUENCE;
 
   @State tracks: VideoEntry[] = [];
@@ -42,6 +53,15 @@ export default struct AudioPlayerPage {
   @State artistText: string = '';
   @State albumText: string = '';
   @State cover: image.PixelMap | undefined = undefined;
+  @State lyrics: LyricLine[] = [];
+  @State lyricsSynced: boolean = false;
+  @State lyricsRaw: string = '';
+  @State lyricIndex: number = -1;
+  @State showLyrics: boolean = false;
+  @State isLandscape: boolean = false;
+  /** 歌词列表实测高度，用于计算首尾留白使任意行都能居中 */
+  @State lyricViewH: number = 220;
+  private lyricScroller: Scroller = new Scroller();
 
   
   private speedValues: media.PlaybackSpeed[] = [
@@ -126,6 +146,10 @@ export default struct AudioPlayerPage {
     this.completed = false;
     this.currentTime = 0;
     this.duration = 0;
+    this.lyrics = [];
+    this.lyricsSynced = false;
+    this.lyricsRaw = '';
+    this.lyricIndex = -1;
     this.loadMeta(entry);
     try {
       StreamServer.getInstance().clearLastServeError();
@@ -138,7 +162,8 @@ export default struct AudioPlayerPage {
       } else {
         await player.reset();
       }
-      await this.withTimeout(StreamServer.getInstance().warmup(entry.path), 20000, '音频加载');
+      // 音频没有 moov 尾部，只等文件大小 + 最多 1.2s 头部预取，其余转后台，切换路径不再被预取拖住
+      await this.withTimeout(StreamServer.getInstance().warmup(entry.path, 1200, false), 20000, '音频加载');
       player.url = StreamServer.getInstance().urlFor(entry.path);
       const ready = await this.waitForState(player, 'initialized', 8000);
       if (!ready) {
@@ -157,6 +182,7 @@ export default struct AudioPlayerPage {
       this.ensureBackgroundTask();
       this.syncSessionState();
       this.syncSessionMetadata();
+      this.scheduleNeighborMetaPrefetch();
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'audio play failed: %{public}s serveErr=%{public}s',
         JSON.stringify(e), StreamServer.getInstance().getLastServeError());
@@ -201,6 +227,7 @@ export default struct AudioPlayerPage {
     player.on('timeUpdate', (time: number) => {
       if (!this.dragging) {
         this.currentTime = time;
+        this.updateLyricIndex(time);
       }
       if (this.duration === 0) {
         this.duration = player.duration;
@@ -349,6 +376,7 @@ export default struct AudioPlayerPage {
     }
     this.switchInProgress = true;
     try {
+      this.switchDir = delta >= 0 ? 1 : -1;
       this.index = next;
       await this.playTrack(this.tracks[next]);
     } finally {
@@ -390,6 +418,9 @@ export default struct AudioPlayerPage {
       return;
     }
     this.switchInProgress = true;
+    if (mode !== avSession.LoopMode.LOOP_MODE_SHUFFLE) {
+      this.switchDir = 1;
+    }
     this.index = next;
     this.playTrack(this.tracks[next]).finally(() => {
       this.switchInProgress = false;
@@ -461,6 +492,7 @@ export default struct AudioPlayerPage {
     }
     const target = Math.min(Math.max(time, 0), this.duration);
     this.currentTime = target;
+    this.updateLyricIndex(target);
     try {
       p.seek(target);
     } catch (e) {
@@ -512,17 +544,120 @@ export default struct AudioPlayerPage {
     if (m === SliderChangeMode.Begin) {
       this.dragging = true;
       this.currentTime = v;
+      this.updateLyricIndex(v);
       return;
     }
     if (m === SliderChangeMode.Moving) {
       this.currentTime = v;
+      this.updateLyricIndex(v);
       return;
     }
     this.dragging = false;
     this.seekTo(v);
   }
 
+  // ---------------- 歌词 ----------------
+
+  /** 根据播放进度定位当前歌词行；无时间轴歌词不做高亮与滚动 */
+  private updateLyricIndex(time: number): void {
+    if (!this.lyricsSynced || this.lyrics.length === 0) {
+      return;
+    }
+    let idx = -1;
+    for (let i = 0; i < this.lyrics.length; i++) {
+      if (this.lyrics[i].timeMs <= time) {
+        idx = i;
+      } else {
+        break;
+      }
+    }
+    if (idx === this.lyricIndex) {
+      return;
+    }
+    this.lyricIndex = idx;
+    this.scrollLyricTo(idx);
+  }
+
+  private scrollLyricTo(idx: number): void {
+    if (!this.showLyrics || idx < 0) {
+      return;
+    }
+    try {
+      // 上下各留半个可视高度，配合 ScrollAlign.CENTER 让当前行停在列表中间
+      this.lyricScroller.scrollToIndex(idx, true, ScrollAlign.CENTER);
+    } catch (e) {
+      hilog.debug(DOMAIN, TAG, 'lyric scroll failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  private toggleLyrics(): void {
+    this.showLyrics = !this.showLyrics;
+    if (this.showLyrics) {
+      // 等 List 挂载后再定位到当前行
+      setTimeout(() => {
+        this.scrollLyricTo(this.lyricIndex);
+      }, 60);
+    }
+  }
+
+  private lyricSpacerH(): number {
+    const h = this.lyricViewH / 2 - 26;
+    return h > 30 ? h : 30;
+  }
+
   // ---------------- 元数据 ----------------
+
+  /** 起播后延迟预读相邻曲目的元数据：弱网下切换时标题/封面直接命中缓存，不再等 SMB */
+  private scheduleNeighborMetaPrefetch(): void {
+    if (this.metaPrefetchTimer >= 0) {
+      clearTimeout(this.metaPrefetchTimer);
+    }
+    this.metaPrefetchTimer = setTimeout(() => {
+      this.metaPrefetchTimer = -1;
+      this.prefetchNeighborMeta();
+    }, NEIGHBOR_PREFETCH_DELAY_MS);
+  }
+
+  /** 预读窗口路径：先沿切歌方向由近到远，再补反方向，越界即止 */
+  private metaPrefetchPaths(): string[] {
+    const paths: string[] = [];
+    const total = this.tracks.length;
+    const dir = this.switchDir >= 0 ? 1 : -1;
+    for (let k = 1; k <= PREFETCH_FORWARD; k++) {
+      const i = this.index + dir * k;
+      if (i < 0 || i >= total) {
+        break;
+      }
+      paths.push(this.tracks[i].path);
+    }
+    for (let k = 1; k <= PREFETCH_BACK; k++) {
+      const i = this.index - dir * k;
+      if (i < 0 || i >= total) {
+        break;
+      }
+      paths.push(this.tracks[i].path);
+    }
+    return paths;
+  }
+
+  /** 串行预读窗口内曲目；用户中途切歌（seq 变化）立刻让路，不抢占正在播放的带宽 */
+  private async prefetchNeighborMeta(): Promise<void> {
+    const seq = this.prefetchSeq + 1;
+    this.prefetchSeq = seq;
+    const paths = this.metaPrefetchPaths();
+    for (let i = 0; i < paths.length; i++) {
+      if (this.destroyed || this.switchInProgress || this.prefetchSeq !== seq) {
+        return;
+      }
+      const path = paths[i];
+      try {
+        await AudioMetaUtil.getInstance().get(path);
+        hilog.info(DOMAIN, TAG, 'neighbor meta prefetched path=%{public}s', path);
+      } catch (e) {
+        hilog.debug(DOMAIN, TAG, 'neighbor meta prefetch failed: %{public}s', JSON.stringify(e));
+      }
+    }
+  }
 
   private async loadMeta(entry: VideoEntry): Promise<void> {
     this.titleText = entry.name;
@@ -538,6 +673,24 @@ export default struct AudioPlayerPage {
     this.artistText = meta.artist;
     this.albumText = meta.album;
     this.cover = meta.cover;
+    this.syncSessionMetadata();
+    this.loadLyrics(entry, meta.lyricText);
+  }
+
+  /** 歌词按「同名 .lrc → 内嵌歌词」顺序加载，失败不影响播放 */
+  private async loadLyrics(entry: VideoEntry, embeddedText: string): Promise<void> {
+    const ly: Lyrics = await LyricsUtil.getInstance().load(entry.path, embeddedText);
+    const cur = this.currentEntry();
+    if (this.destroyed || cur === undefined || cur.path !== entry.path) {
+      return;
+    }
+    this.lyrics = ly.lines;
+    this.lyricsSynced = ly.synced;
+    this.lyricsRaw = ly.raw;
+    this.lyricIndex = -1;
+    hilog.info(DOMAIN, TAG, 'lyrics loaded path=%{public}s lines=%{public}d synced=%{public}s',
+      entry.path, ly.lines.length, String(ly.synced));
+    this.updateLyricIndex(this.currentTime);
     this.syncSessionMetadata();
   }
 
@@ -641,6 +794,9 @@ export default struct AudioPlayerPage {
     if (this.cover !== undefined) {
       md.mediaImage = this.cover;
     }
+    if (this.lyricsRaw.length > 0) {
+      md.lyric = this.lyricsRaw;
+    }
     // previous/nextAssetId 决定播控中心上一曲/下一曲按钮是否可用
     if (this.index - 1 >= 0 && this.index - 1 < this.tracks.length) {
       md.previousAssetId = this.tracks[this.index - 1].path;
@@ -714,6 +870,10 @@ export default struct AudioPlayerPage {
   }
 
   private async releaseAll(): Promise<void> {
+    if (this.metaPrefetchTimer >= 0) {
+      clearTimeout(this.metaPrefetchTimer);
+      this.metaPrefetchTimer = -1;
+    }
     await this.stopBackgroundTask();
     const s = this.session;
     this.session = undefined;
@@ -749,158 +909,289 @@ export default struct AudioPlayerPage {
 
   // ---------------- UI ----------------
 
+  // ---------------- 歌词/控制 @Builder ----------------
+
+  /** 媒体区：封面与歌词共用同一块区域，点击切换 */
+  @Builder
+  mediaBox(boxW: Length, boxH: Length) {
+    Stack({ alignContent: Alignment.Center }) {
+      if (this.showLyrics) {
+        this.lyricsView(boxH)
+      } else if (this.cover !== undefined) {
+        Image(this.cover)
+          .objectFit(ImageFit.Cover)
+          .width('100%')
+          .height('100%')
+      } else {
+        Text('♪')
+          .fontSize(64)
+          .fontColor($r('app.color.text_secondary'))
+      }
+    }
+    .width(boxW)
+    .height(boxH)
+    .backgroundColor($r('app.color.poster_bg'))
+    .borderRadius(16)
+    .clip(true)
+    .onClick(() => {
+      this.toggleLyrics();
+    })
+  }
+
+  /** 歌词列表：当前行高亮并居中。有时间轴时禁用列表自身滚动（交给自动跟随，同时避免吞掉切歌手势），无时间轴时允许手动滚动 */
+  @Builder
+  lyricsView(boxH: Length) {
+    if (this.lyrics.length === 0) {
+      Column({ space: 8 }) {
+        Text('♪')
+          .fontSize(28)
+          .fontColor($r('app.color.text_secondary'))
+        Text('暂无歌词')
+          .fontSize(14)
+          .fontColor($r('app.color.text_secondary'))
+      }
+    } else {
+      List({ space: 12, scroller: this.lyricScroller }) {
+        ForEach(this.lyrics, (item: LyricLine, idx: number) => {
+          ListItem() {
+            Text(item.text.length > 0 ? item.text : ' ')
+              .fontSize(idx === this.lyricIndex ? 18 : 16)
+              .fontWeight(idx === this.lyricIndex ? FontWeight.Medium : FontWeight.Normal)
+              .fontColor(idx === this.lyricIndex
+                ? $r('app.color.theme_primary')
+                : $r('app.color.text_secondary'))
+              .textAlign(TextAlign.Center)
+              .width('100%')
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          .width('100%')
+        }, (item: LyricLine, idx: number) => idx + '|' + item.timeMs + '|' + item.text)
+      }
+      .width('100%')
+      .height(boxH)
+      .scrollBar(BarState.Off)
+      .enableScrollInteraction(!this.lyricsSynced)
+      .contentStartOffset(this.lyricSpacerH())
+      .contentEndOffset(this.lyricSpacerH())
+      .onAreaChange((_oldArea: Area, newArea: Area) => {
+        const h = newArea.height;
+        if (typeof h === 'number' && h > 0) {
+          this.lyricViewH = h;
+        }
+      })
+    }
+  }
+
+  @Builder
+  titleBlock() {
+    Column({ space: 6 }) {
+      Text(this.titleText.length > 0 ? this.titleText : this.currentName())
+        .fontSize(18)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_main'))
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .textAlign(TextAlign.Center)
+        .width('100%')
+      Text(this.subText())
+        .fontSize(12)
+        .fontColor($r('app.color.text_secondary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .textAlign(TextAlign.Center)
+        .width('100%')
+    }
+    .width('100%')
+    .padding({ left: this.isLandscape ? 8 : 24, right: this.isLandscape ? 8 : 24 })
+  }
+
+  @Builder
+  playControls() {
+    if (this.loading) {
+      Column({ space: 8 }) {
+        LoadingProgress()
+          .width(36)
+          .height(36)
+          .color($r('app.color.theme_primary'))
+        Text('加载中…')
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+      }
+    }
+
+    if (this.errorMsg.length > 0) {
+      Column({ space: 12 }) {
+        Text(this.errorMsg)
+          .fontSize(14)
+          .fontColor($r('app.color.text_main'))
+          .textAlign(TextAlign.Center)
+          .padding({ left: 30, right: 30 })
+        Button('重试')
+          .fontSize(14)
+          .height(36)
+          .backgroundColor($r('app.color.theme_primary'))
+          .onClick(() => {
+            const e = this.currentEntry();
+            if (e !== undefined) {
+              this.playTrack(e);
+            }
+          })
+      }
+    }
+
+    Row({ space: 8 }) {
+      Text(MediaUtil.formatDuration(this.currentTime))
+        .fontSize(12)
+        .fontColor($r('app.color.text_secondary'))
+      Slider({
+        value: this.currentTime,
+        min: 0,
+        max: Math.max(this.duration, 1),
+        step: 1,
+        style: SliderStyle.OutSet
+      })
+        .layoutWeight(1)
+        .onChange((v: number, m: SliderChangeMode) => {
+          this.onSliderChange(v, m);
+        })
+      Text(MediaUtil.formatDuration(this.duration))
+        .fontSize(12)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .width('100%')
+    .padding({ left: this.isLandscape ? 8 : 20, right: this.isLandscape ? 8 : 20 })
+
+    Row({ space: this.isLandscape ? 10 : 14 }) {
+      Button('上一曲')
+        .height(this.isLandscape ? 36 : 44)
+        .fontSize(this.isLandscape ? 13 : 15)
+        .backgroundColor($r('app.color.card_bg'))
+        .fontColor($r('app.color.text_main'))
+        .onClick(() => {
+          this.switchTrack(-1);
+        })
+      Button(this.playing ? '暂停' : '播放')
+        .width(this.isLandscape ? 88 : 104)
+        .height(this.isLandscape ? 40 : 48)
+        .fontSize(this.isLandscape ? 14 : 16)
+        .backgroundColor($r('app.color.theme_primary'))
+        .onClick(() => {
+          this.togglePlay();
+        })
+      Button('下一曲')
+        .height(this.isLandscape ? 36 : 44)
+        .fontSize(this.isLandscape ? 13 : 15)
+        .backgroundColor($r('app.color.card_bg'))
+        .fontColor($r('app.color.text_main'))
+        .onClick(() => {
+          this.switchTrack(1);
+        })
+    }
+
+    Row({ space: this.isLandscape ? 8 : 12 }) {
+      Button(this.speedLabels[this.speedIdx])
+        .height(this.isLandscape ? 30 : 34)
+        .fontSize(this.isLandscape ? 12 : 13)
+        .backgroundColor($r('app.color.card_bg'))
+        .fontColor($r('app.color.text_main'))
+        .onClick(() => {
+          this.cycleSpeed();
+        })
+      Button(this.loopLabel())
+        .height(this.isLandscape ? 30 : 34)
+        .fontSize(this.isLandscape ? 12 : 13)
+        .backgroundColor($r('app.color.card_bg'))
+        .fontColor($r('app.color.text_main'))
+        .onClick(() => {
+          this.cycleLoopMode();
+        })
+      Button(this.showLyrics ? '封面' : '歌词')
+        .height(this.isLandscape ? 30 : 34)
+        .fontSize(this.isLandscape ? 12 : 13)
+        .backgroundColor($r('app.color.card_bg'))
+        .fontColor($r('app.color.text_main'))
+        .onClick(() => {
+          this.toggleLyrics();
+        })
+      Text((this.index + 1) + ' / ' + this.tracks.length +
+        (this.extText().length > 0 ? ' · ' + this.extText() : ''))
+        .fontSize(12)
+        .fontColor($r('app.color.text_secondary'))
+        .layoutWeight(1)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .width('100%')
+  }
+
   build() {
     NavDestination() {
-      Column({ space: 16 }) {
-        Stack({ alignContent: Alignment.Center }) {
-          if (this.cover !== undefined) {
-            Image(this.cover)
-              .objectFit(ImageFit.Cover)
+      Stack() {
+        if (this.isLandscape) {
+          Row({ space: 16 }) {
+            Column() {
+              if (this.showLyrics) {
+                this.mediaBox('100%', '100%')
+              } else {
+                this.mediaBox(180, 180)
+              }
+            }
+            .width(this.showLyrics ? 280 : 200)
+            .height('100%')
+            .justifyContent(FlexAlign.Center)
+
+            Scroll() {
+              Column({ space: 10 }) {
+                this.titleBlock()
+                this.playControls()
+              }
               .width('100%')
-              .height('100%')
-          } else {
-            Text('♪')
-              .fontSize(64)
-              .fontColor($r('app.color.text_secondary'))
-          }
-        }
-        .width(220)
-        .height(220)
-        .backgroundColor($r('app.color.poster_bg'))
-        .borderRadius(16)
-        .clip(true)
-        .margin({ top: 26 })
-
-        Column({ space: 6 }) {
-          Text(this.titleText.length > 0 ? this.titleText : this.currentName())
-            .fontSize(18)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.text_main'))
-            .maxLines(2)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .textAlign(TextAlign.Center)
-            .width('100%')
-          Text(this.subText())
-            .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .textAlign(TextAlign.Center)
-            .width('100%')
-        }
-        .width('100%')
-        .padding({ left: 24, right: 24 })
-
-        if (this.loading) {
-          Column({ space: 8 }) {
-            LoadingProgress()
-              .width(36)
-              .height(36)
-              .color($r('app.color.theme_primary'))
-            Text('加载中…')
-              .fontSize(12)
-              .fontColor($r('app.color.text_secondary'))
-          }
-        }
-
-        if (this.errorMsg.length > 0) {
-          Column({ space: 12 }) {
-            Text(this.errorMsg)
-              .fontSize(14)
-              .fontColor($r('app.color.text_main'))
-              .textAlign(TextAlign.Center)
-              .padding({ left: 30, right: 30 })
-            Button('重试')
-              .fontSize(14)
-              .height(36)
-              .backgroundColor($r('app.color.theme_primary'))
-              .onClick(() => {
-                const e = this.currentEntry();
-                if (e !== undefined) {
-                  this.playTrack(e);
-                }
-              })
-          }
-        }
-
-        Row({ space: 8 }) {
-          Text(MediaUtil.formatDuration(this.currentTime))
-            .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
-          Slider({
-            value: this.currentTime,
-            min: 0,
-            max: Math.max(this.duration, 1),
-            step: 1,
-            style: SliderStyle.OutSet
-          })
+              .padding({ top: 8, bottom: 8 })
+            }
             .layoutWeight(1)
-            .onChange((v: number, m: SliderChangeMode) => {
-              this.onSliderChange(v, m);
-            })
-          Text(MediaUtil.formatDuration(this.duration))
-            .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
+            .height('100%')
+            .scrollBar(BarState.Off)
+          }
+          .width('100%')
+          .height('100%')
+          .padding({ left: 16, right: 16 })
+        } else {
+          Column({ space: 14 }) {
+            if (this.showLyrics) {
+              Column() {
+                this.mediaBox('100%', '100%')
+              }
+              .width('100%')
+              .layoutWeight(1)
+              .padding({ left: 16, right: 16 })
+            } else {
+              this.mediaBox(220, 220)
+            }
+            this.titleBlock()
+            if (!this.showLyrics) {
+              Blank()
+            }
+            this.playControls()
+          }
+          .width('100%')
+          .height('100%')
+          .padding({ top: 26, bottom: 12 })
         }
-        .width('100%')
-        .padding({ left: 20, right: 20 })
-
-        Row({ space: 14 }) {
-          Button('上一曲')
-            .height(44)
-            .fontSize(15)
-            .backgroundColor($r('app.color.card_bg'))
-            .fontColor($r('app.color.text_main'))
-            .onClick(() => {
-              this.switchTrack(-1);
-            })
-          Button(this.playing ? '暂停' : '播放')
-            .width(104)
-            .height(48)
-            .fontSize(16)
-            .backgroundColor($r('app.color.theme_primary'))
-            .onClick(() => {
-              this.togglePlay();
-            })
-          Button('下一曲')
-            .height(44)
-            .fontSize(15)
-            .backgroundColor($r('app.color.card_bg'))
-            .fontColor($r('app.color.text_main'))
-            .onClick(() => {
-              this.switchTrack(1);
-            })
-        }
-
-        Row({ space: 12 }) {
-          Button(this.speedLabels[this.speedIdx])
-            .height(34)
-            .fontSize(13)
-            .backgroundColor($r('app.color.card_bg'))
-            .fontColor($r('app.color.text_main'))
-            .onClick(() => {
-              this.cycleSpeed();
-            })
-          Button(this.loopLabel())
-            .height(34)
-            .fontSize(13)
-            .backgroundColor($r('app.color.card_bg'))
-            .fontColor($r('app.color.text_main'))
-            .onClick(() => {
-              this.cycleLoopMode();
-            })
-          Text((this.index + 1) + ' / ' + this.tracks.length +
-            (this.extText().length > 0 ? ' · ' + this.extText() : ''))
-            .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
-        }
-        .margin({ bottom: 10 })
-
-        Blank()
       }
       .width('100%')
       .height('100%')
       .backgroundColor($r('app.color.theme_bg'))
+      .onAreaChange((_oldArea: Area, newArea: Area) => {
+        const w = newArea.width;
+        const h = newArea.height;
+        if (typeof w === 'number' && typeof h === 'number' && h > 0) {
+          const land = w > h * 1.15;
+          if (land !== this.isLandscape) {
+            this.isLandscape = land;
+          }
+        }
+      })
       .gesture(
         GestureGroup(GestureMode.Exclusive,
           PanGesture({ direction: PanDirection.Up, distance: 30 })

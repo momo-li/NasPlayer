@@ -2,11 +2,15 @@ import { image } from '@kit.ImageKit';
 import { media } from '@kit.MediaKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SmbService } from './SmbService';
+import { LyricsUtil } from './LyricsUtil';
+import { StreamServer } from './StreamServer';
 
 const DOMAIN = 0x0000;
 const TAG = 'NasPlayer';
-/** 预读文件头长度：MP3/FLAC/WAV 的标签与封面通常在文件头部 */
-const HEAD_BYTES = 1048576;
+/** 首次读取的文件头长度：覆盖绝大多数 ID3v2/FLAC 标签，并留出音频帧供时长探测 */
+const MIN_HEAD_BYTES = 262144;
+/** 标签很大（如整轨内嵌封面）时的读取上限 */
+const MAX_HEAD_BYTES = 1048576;
 const MAX_CACHED = 8;
 
 export class AudioMeta {
@@ -14,6 +18,8 @@ export class AudioMeta {
   artist: string = '';
   album: string = '';
   cover: image.PixelMap | undefined = undefined;
+  /** 内嵌歌词原文（ID3v2 USLT / FLAC Vorbis LYRICS）；侧车 .lrc 优先，这里只做兜底 */
+  lyricText: string = '';
 
   static of(title: string, artist: string, album: string, cover: image.PixelMap | undefined): AudioMeta {
     const m = new AudioMeta();
@@ -59,11 +65,12 @@ export class AudioMetaUtil {
     if (size <= 0) {
       throw new Error('文件为空');
     }
-    const headLen = Math.min(size, HEAD_BYTES);
-    const data = await smb.readRange(path, 0, headLen);
+    const data = await this.readHead(path, size);
     if (data.length === 0) {
       throw new Error('读取失败');
     }
+    // 顺手把已读到的文件头交给流服务：音频起播的首个 Range 请求可直接命中内存，省掉一次重复读取
+    StreamServer.getInstance().cacheHead(path, data);
     const extractor = await media.createAVMetadataExtractor();
     try {
       const src: media.AVDataSrcDescriptor = {
@@ -101,7 +108,10 @@ export class AudioMetaUtil {
       }
       hilog.info(DOMAIN, TAG, 'audio meta ok path=%{public}s title=%{public}s artist=%{public}s cover=%{public}s',
         path, title, artist, String(cover !== undefined));
-      return AudioMeta.of(title, artist, album, cover);
+      const meta = AudioMeta.of(title, artist, album, cover);
+      // 复用已预读的文件头解析内嵌歌词，避免为歌词再走一次 SMB 读取
+      meta.lyricText = LyricsUtil.extractEmbeddedLyric(data);
+      return meta;
     } finally {
       try {
         await extractor.release();
@@ -109,6 +119,52 @@ export class AudioMetaUtil {
         hilog.debug(DOMAIN, TAG, 'metadata extractor release failed: %{public}s', JSON.stringify(e));
       }
     }
+  }
+
+  /** 按标签实际长度决定读多少：先 256KB，标签更大（整轨封面/多图）再补读，避免弱网下白读 1MB */
+  private async readHead(path: string, size: number): Promise<Uint8Array> {
+    const smb = SmbService.getInstance();
+    const firstLen = Math.min(size, MIN_HEAD_BYTES);
+    const data = await smb.readRange(path, 0, firstLen);
+    if (data.length === 0 || firstLen >= size || firstLen >= MAX_HEAD_BYTES) {
+      return data;
+    }
+    const need = AudioMetaUtil.tagEnd(data);
+    if (need <= data.length) {
+      return data;
+    }
+    const want = Math.min(size, Math.min(need + MIN_HEAD_BYTES, MAX_HEAD_BYTES));
+    const more = await smb.readRange(path, 0, want);
+    return more.length > data.length ? more : data;
+  }
+
+  /** 标签结束位置（含）用于判断是否读全：ID3v2 用声明长度，FLAC 累加元数据块；无法判断返回 0 */
+  private static tagEnd(data: Uint8Array): number {
+    if (data.length < 10) {
+      return 0;
+    }
+    if (data[0] === 0x49 && data[1] === 0x44 && data[2] === 0x33) {
+      const size = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) |
+        ((data[8] & 0x7F) << 7) | (data[9] & 0x7F);
+      return size + 10;
+    }
+    if (data[0] === 0x66 && data[1] === 0x4C && data[2] === 0x61 && data[3] === 0x43) {
+      let pos = 4;
+      while (pos + 4 <= data.length) {
+        const head = data[pos];
+        const isLast = (head & 0x80) !== 0;
+        const len = (data[pos + 1] << 16) | (data[pos + 2] << 8) | data[pos + 3];
+        if (len < 0) {
+          return 0;
+        }
+        pos = pos + 4 + len;
+        if (isLast) {
+          return pos;
+        }
+      }
+      return pos;
+    }
+    return 0;
   }
 
   /** 无标签时回退为“去掉扩展名的文件名” */
