@@ -505,6 +505,13 @@ export class SmbPacket {
     return SmbPacket.createReqWithAccess(fileName, isDirectory, 0x00010000, !isDirectory, 0x00001000);
   }
 
+  /** 删除用打开（自定义 DesiredAccess）：目录删除时部分服务端要求带 FILE_LIST_DIRECTORY(0x1)，
+   *  否则仅 DELETE 的目录打开会被拒绝（表现为文件夹一律删除失败）。 */
+  static createDeleteReqWithAccess(fileName: string, isDirectory: boolean,
+    accessMask: number): Uint8Array {
+    return SmbPacket.createReqWithAccess(fileName, isDirectory, accessMask, !isDirectory);
+  }
+
   /** SET_INFO 通用请求。variant 用于兼容不同服务端实现：
    *  0/1 = 标准（StructureSize 33，固定体 32，BufferOffset 96）
    *  2   = StructureSize 声明为 32

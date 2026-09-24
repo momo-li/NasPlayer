@@ -302,6 +302,7 @@ export default struct PlayerPage {
   private async cleanup(): Promise<void> {
     hilog.info(0x0000, 'NasPlayer', 'player cleanup start, hasPlayer=%{public}s', String(this.avPlayer !== undefined));
     this.destroyed = true;
+    this.setKeepScreenOn(false);
     if (this.hideTimer >= 0) {
       clearTimeout(this.hideTimer);
       this.hideTimer = -1;
@@ -338,18 +339,35 @@ export default struct PlayerPage {
     }
   }
 
+  /** 视频播放期间保持屏幕常亮；暂停/播放结束/退出页面必须复位为 false，
+   *  否则系统会判定为滥用常亮而强制恢复自动熄屏（官方规范用法）。 */
+  private setKeepScreenOn(on: boolean): void {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const win = ctx.windowStage.getMainWindowSync();
+      win.setWindowKeepScreenOn(on).catch((e: BusinessError) => {
+        console.error('set keep screen on failed: ' + JSON.stringify(e));
+      });
+    } catch (e) {
+      console.error('set keep screen on failed: ' + JSON.stringify(e));
+    }
+  }
+
   private attachEvents(player: media.AVPlayer): void {
     player.on('stateChange', (state: media.AVPlayerState) => {
       hilog.info(0x0000, 'NasPlayer', 'avplayer stateChange -> %{public}s', state);
       if (state === 'playing') {
         this.playing = true;
         this.errorMsg = '';
+        this.setKeepScreenOn(true);
         this.showControlsTemporarily();
       } else if (state === 'paused') {
         this.playing = false;
+        this.setKeepScreenOn(false);
       } else if (state === 'completed') {
         this.playing = false;
         this.completed = true;
+        this.setKeepScreenOn(false);
       }
     });
     player.on('timeUpdate', (time: number) => {
@@ -366,6 +384,7 @@ export default struct PlayerPage {
       // 加载/准备期间出错由 playEntry catch 统一提示，这里避免重复弹提示
       if (!this.loading) {
         this.loading = false;
+        this.setKeepScreenOn(false);
         this.errorMsg = PlayerPage.describePlayerError(err, StreamServer.getInstance().getLastServeError());
       }
     });

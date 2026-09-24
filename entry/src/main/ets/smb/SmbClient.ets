@@ -673,38 +673,102 @@ export class SmbClient {
     return f.endOfFile;
   }
 
-  /** 删除文件/空文件夹：优先 FILE_DELETE_ON_CLOSE，服务端不支持时回退 SET_INFO 删除标记 */
+  /** 删除文件/文件夹。
+   *  文件：优先 FILE_DELETE_ON_CLOSE（服务端在 CLOSE 时删除），被拒时回退 SET_INFO 删除标记。
+   *  文件夹：服务端差异极大——不少服务端拒绝目录的 FILE_DELETE_ON_CLOSE，也拒绝“仅 DELETE 权限”的
+   *  目录打开（这正是所有文件夹都删不掉的原因）。因此目录改为：优先 SET_INFO 删除标记（依次尝试
+   *  DELETE|FILE_LIST_DIRECTORY 与 DELETE 两种权限），再回退 FILE_DELETE_ON_CLOSE。 */
   async deleteEntry(relPath: string, isDirectory: boolean): Promise<void> {
-    let info: CreateInfo | undefined = undefined;
+    if (isDirectory) {
+      await this.deleteDirectory(relPath);
+    } else {
+      await this.deleteFile(relPath);
+    }
+  }
+
+  private async deleteFile(relPath: string): Promise<void> {
     try {
-      info = await this.createRaw(SmbPacket.createDeleteOnCloseReq(relPath, isDirectory));
+      const info = await this.createRaw(SmbPacket.createDeleteOnCloseReq(relPath, false));
+      await this.closeFileStrict(info.fileId);
+      hilog.info(DOMAIN, TAG, 'delete ok(delete-on-close) file path=%{public}s', relPath);
+      this.dirCache.clear();
+      return;
     } catch (e) {
-      info = undefined;
       if (!SmbClient.isUnsupportedDeleteError(e)) {
         throw e as Error;
       }
-      hilog.warn(DOMAIN, TAG, 'delete on close rejected, fallback to setinfo: %{public}s',
+      hilog.warn(DOMAIN, TAG, 'delete file on-close rejected, fallback setinfo: %{public}s',
         JSON.stringify(e));
     }
-    if (info !== undefined) {
-      await this.closeFileStrict(info.fileId);
-      hilog.info(DOMAIN, TAG, 'delete ok(delete-on-close) path=%{public}s dir=%{public}s',
-        relPath, String(isDirectory));
+    await this.deleteViaDisposition(relPath, false);
+    hilog.info(DOMAIN, TAG, 'delete ok(setinfo) file path=%{public}s', relPath);
+    this.dirCache.clear();
+  }
+
+  private async deleteDirectory(relPath: string): Promise<void> {
+    let firstErr: Error | undefined = undefined;
+    try {
+      await this.deleteViaDisposition(relPath, true);
+      hilog.info(DOMAIN, TAG, 'delete ok(setinfo) dir path=%{public}s', relPath);
       this.dirCache.clear();
       return;
-    }
-    const f = await this.createRaw(SmbPacket.createDeleteReq(relPath, isDirectory));
-    try {
-      await this.sendSetInfo(f.fileId, 13, SmbPacket.dispositionInfoBuffer());
     } catch (e) {
-      // SET_INFO 失败：关闭句柄后透出原始错误
-      await this.closeFile(f.fileId);
+      // 目录非空是确定性失败：无需再尝试其它方式
+      if (SmbClient.isDirectoryNotEmpty(e)) {
+        throw e as Error;
+      }
+      firstErr = e as Error;
+      hilog.warn(DOMAIN, TAG, 'delete dir via setinfo failed, fallback on-close: %{public}s',
+        JSON.stringify(e));
+    }
+    try {
+      const info = await this.createRaw(SmbPacket.createDeleteOnCloseReq(relPath, true));
+      await this.closeFileStrict(info.fileId);
+      hilog.info(DOMAIN, TAG, 'delete ok(delete-on-close) dir path=%{public}s', relPath);
+      this.dirCache.clear();
+      return;
+    } catch (e) {
+      if (SmbClient.isDirectoryNotEmpty(e)) {
+        throw e as Error;
+      }
+      hilog.warn(DOMAIN, TAG, 'delete dir via on-close also failed: %{public}s', JSON.stringify(e));
+      if (firstErr !== undefined) {
+        throw firstErr;
+      }
       throw e as Error;
     }
-    await this.closeFileStrict(f.fileId);
-    hilog.info(DOMAIN, TAG, 'delete ok(setinfo) path=%{public}s dir=%{public}s',
-      relPath, String(isDirectory));
-    this.dirCache.clear();
+  }
+
+  /** 打开句柄 → SET_INFO FileDispositionInformation(13 删除标记) → CLOSE。
+   *  目录依次尝试 DELETE|FILE_LIST_DIRECTORY、DELETE 两种 DesiredAccess（前者兼容性更好）。 */
+  private async deleteViaDisposition(relPath: string, isDirectory: boolean): Promise<void> {
+    const masks: number[] = isDirectory ? [0x00010001, 0x00010000] : [0x00010000];
+    let lastErr: Error | undefined = undefined;
+    for (let i = 0; i < masks.length; i++) {
+      try {
+        const f = await this.createRaw(
+          SmbPacket.createDeleteReqWithAccess(relPath, isDirectory, masks[i]));
+        try {
+          await this.sendSetInfo(f.fileId, 13, SmbPacket.dispositionInfoBuffer());
+        } catch (e) {
+          await this.closeFile(f.fileId);
+          throw e as Error;
+        }
+        await this.closeFileStrict(f.fileId);
+        return;
+      } catch (e) {
+        lastErr = e as Error;
+        if (SmbClient.isDirectoryNotEmpty(e)) {
+          throw e as Error;
+        }
+        hilog.warn(DOMAIN, TAG, 'delete disposition access=0x%{public}s failed: %{public}s',
+          masks[i].toString(16), JSON.stringify(e));
+      }
+    }
+    if (lastErr !== undefined) {
+      throw lastErr;
+    }
+    throw new SmbError(0, '[DELETE] 删除失败');
   }
 
   private static isUnsupportedDeleteError(e: Object): boolean {
@@ -712,6 +776,10 @@ export class SmbClient {
       return e.status === SmbStatus.INVALID_PARAMETER || e.status === SmbStatus.NOT_SUPPORTED;
     }
     return false;
+  }
+
+  private static isDirectoryNotEmpty(e: Object): boolean {
+    return e instanceof SmbError && e.status === SmbStatus.DIRECTORY_NOT_EMPTY;
   }
 
   /** SET_INFO 兼容探测：依次尝试各变体，成功后记住可用变体供后续复用 */

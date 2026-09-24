@@ -1262,14 +1262,6 @@ export default struct AudioPlayerPage {
       })
       .gesture(
         GestureGroup(GestureMode.Exclusive,
-          PanGesture({ direction: PanDirection.Up, distance: 30 })
-            .onActionEnd(() => {
-              this.switchTrack(1);
-            }),
-          PanGesture({ direction: PanDirection.Down, distance: 30 })
-            .onActionEnd(() => {
-              this.switchTrack(-1);
-            }),
           PanGesture({ direction: PanDirection.Right, distance: 30 })
             .onActionEnd(() => {
               this.seekBy(10000);
