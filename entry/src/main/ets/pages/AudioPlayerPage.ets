@@ -38,6 +38,11 @@ export default struct AudioPlayerPage {
   private switchDir: number = 1;
   /** 预读轮次：切歌后旧轮次自动作废 */
   private prefetchSeq: number = 0;
+  /** 上一次“播完”的处理时间：endOfStream 与 stateChange 双事件去重 */
+  private lastFinishAt: number = 0;
+  /** 上一次把 loopMode 上报给系统的时间，用于识别系统回抛 */
+  private lastLoopModePushAt: number = 0;
+  private lastPushedLoopMode: number = -1;
   @State loopMode: avSession.LoopMode = avSession.LoopMode.LOOP_MODE_SEQUENCE;
 
   @State tracks: VideoEntry[] = [];
@@ -171,6 +176,12 @@ export default struct AudioPlayerPage {
       }
       // 音频播放无需设置 surfaceId
       await this.prepareWithTimeout(player, 10000);
+      // 与视频同理：prepare() 的 Promise 可能早于 stateChange('prepared')，
+      // 在 initialized 下 play() 会抛 5400102
+      const prepared = await this.waitForState(player, 'prepared', 5000);
+      if (!prepared) {
+        throw new Error(player.state === 'error' ? '音频源准备失败' : '音频准备超时');
+      }
       this.duration = player.duration;
       if (this.speedIdx !== 1) {
         player.setSpeed(this.speedValues[this.speedIdx]);
@@ -218,9 +229,7 @@ export default struct AudioPlayerPage {
       } else if (state === 'paused') {
         this.playing = false;
       } else if (state === 'completed') {
-        this.playing = false;
-        this.completed = true;
-        this.autoNext();
+        this.onTrackFinished();
       }
       this.syncSessionState();
     });
@@ -247,9 +256,31 @@ export default struct AudioPlayerPage {
         this.syncSessionState();
       }
     });
+    // endOfStream 与 stateChange('completed') 都会到达，统一走 onTrackFinished 去重
     player.on('endOfStream', () => {
-      this.completed = true;
+      this.onTrackFinished();
     });
+  }
+
+  /** 一曲播完：去重后延后一拍再续播（不在播放器回调里直接 reset/换源，避免状态机重入卡住） */
+  private onTrackFinished(): void {
+    if (this.destroyed) {
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastFinishAt < 1500) {
+      return;
+    }
+    this.lastFinishAt = now;
+    const finishedIndex = this.index;
+    this.playing = false;
+    this.completed = true;
+    this.syncSessionState();
+    hilog.info(DOMAIN, TAG, 'track finished index=%{public}d mode=%{public}d',
+      finishedIndex, this.loopMode);
+    setTimeout(() => {
+      this.autoNext(finishedIndex, 0);
+    }, 250);
   }
 
   private waitForState(player: media.AVPlayer, target: media.AVPlayerState, timeoutMs: number): Promise<boolean> {
@@ -365,28 +396,51 @@ export default struct AudioPlayerPage {
     if (this.switchInProgress) {
       return;
     }
-    const next = this.index + delta;
-    if (next < 0) {
-      this.showToast('已经是第一首');
-      return;
-    }
-    if (next >= this.tracks.length) {
-      this.showToast('已经是最后一首');
-      return;
+    let target = this.index + delta;
+    if (this.loopMode === avSession.LoopMode.LOOP_MODE_SHUFFLE && this.tracks.length > 1) {
+      // 随机模式下手动切歌也要跳随机：否则“随机”只在自动续播时生效，用户点下一曲仍按顺序走，看起来像功能失效
+      target = Math.floor(Math.random() * this.tracks.length);
+      if (target === this.index) {
+        target = (target + 1) % this.tracks.length;
+      }
+    } else {
+      if (target < 0) {
+        this.showToast('已经是第一首');
+        return;
+      }
+      if (target >= this.tracks.length) {
+        this.showToast('已经是最后一首');
+        return;
+      }
     }
     this.switchInProgress = true;
     try {
       this.switchDir = delta >= 0 ? 1 : -1;
-      this.index = next;
-      await this.playTrack(this.tracks[next]);
+      this.index = target;
+      await this.playTrack(this.tracks[target]);
     } finally {
       this.switchInProgress = false;
     }
   }
 
-  /** 播放完成后的续播逻辑，遵循播控中心设置的循环模式 */
-  private autoNext(): void {
-    if (this.switchInProgress || this.destroyed) {
+  /**
+   * 播放完成后的续播逻辑，遵循播控中心设置的循环模式。
+   * fromIndex 为播完的那一首：若期间用户已手动切歌（index 变了）就不再自动续播，避免覆盖用户选择；
+   * 若正处在切歌过程中则稍后重试，而不是把“自动下一首”直接丢掉。
+   */
+  private autoNext(fromIndex: number, attempt: number): void {
+    if (this.destroyed || this.index !== fromIndex) {
+      hilog.info(DOMAIN, TAG, 'autoNext skipped destroyed=%{public}s index=%{public}d from=%{public}d',
+        String(this.destroyed), this.index, fromIndex);
+      return;
+    }
+    if (this.switchInProgress) {
+      hilog.info(DOMAIN, TAG, 'autoNext deferred, switching in progress attempt=%{public}d', attempt);
+      if (attempt < 5) {
+        setTimeout(() => {
+          this.autoNext(fromIndex, attempt + 1);
+        }, 400);
+      }
       return;
     }
     const mode = this.loopMode;
@@ -414,13 +468,17 @@ export default struct AudioPlayerPage {
       next = 0;
     }
     if (next >= this.tracks.length) {
-      this.showToast('列表已播放完');
+      this.showToast('已经是最后一首，切换“列表”模式可循环播放');
       return;
     }
     this.switchInProgress = true;
     if (mode !== avSession.LoopMode.LOOP_MODE_SHUFFLE) {
       this.switchDir = 1;
+    } else {
+      this.switchDir = next >= this.index ? 1 : -1;
     }
+    hilog.info(DOMAIN, TAG, 'autoNext from=%{public}d to=%{public}d mode=%{public}d',
+      this.index, next, mode);
     this.index = next;
     this.playTrack(this.tracks[next]).finally(() => {
       this.switchInProgress = false;
@@ -446,6 +504,9 @@ export default struct AudioPlayerPage {
       } else if (st === 'paused' || st === 'prepared' || st === 'completed') {
         await p.play();
         this.playing = true;
+        if (this.speedIdx !== 1) {
+          p.setSpeed(this.speedValues[this.speedIdx]);
+        }
       }
       this.syncSessionState();
     } catch (e) {
@@ -462,6 +523,10 @@ export default struct AudioPlayerPage {
       if (p.state === 'paused' || p.state === 'prepared' || p.state === 'completed') {
         await p.play();
         this.playing = true;
+        // 暂停会丢失倍速设置，恢复播放时重新应用，避免界面显示与实际播放速度不一致
+        if (this.speedIdx !== 1) {
+          p.setSpeed(this.speedValues[this.speedIdx]);
+        }
         this.syncSessionState();
       }
     } catch (e) {
@@ -719,6 +784,13 @@ export default struct AudioPlayerPage {
         this.seekTo(time);
       });
       s.on('setLoopMode', (mode: avSession.LoopMode) => {
+        // 系统可能把我们刚上报的 loopMode 回抛（还可能被规范化成别的值），这会直接吃掉用户选的“随机”；
+        // 因此刚上报过的短时间内收到不同值时保留本地意图，真正的播控中心操作才覆盖
+        if (mode !== this.loopMode && Date.now() - this.lastLoopModePushAt < 1500) {
+          hilog.info(DOMAIN, TAG, 'ignore echoed setLoopMode=%{public}d keep=%{public}d', mode, this.loopMode);
+          return;
+        }
+        hilog.info(DOMAIN, TAG, 'session setLoopMode=%{public}d', mode);
         this.loopMode = mode;
         this.syncSessionState();
       });
@@ -829,6 +901,11 @@ export default struct AudioPlayerPage {
       speed: this.speedNumbers[this.speedIdx],
       loopMode: this.loopMode
     };
+    // 记录 loopMode 变更的上报时刻，用于识别系统的回抛（见 setupSession 里的 setLoopMode）
+    if (this.lastPushedLoopMode !== this.loopMode) {
+      this.lastPushedLoopMode = this.loopMode;
+      this.lastLoopModePushAt = Date.now();
+    }
     s.setAVPlaybackState(st).catch((e: Error) => {
       hilog.debug(DOMAIN, TAG, 'setAVPlaybackState failed: %{public}s', JSON.stringify(e));
     });
@@ -911,7 +988,7 @@ export default struct AudioPlayerPage {
 
   // ---------------- 歌词/控制 @Builder ----------------
 
-  /** 媒体区：封面与歌词共用同一块区域，点击切换 */
+  /** 媒体区：封面与歌词共用同一块区域，点击切换；歌词模式背景透明，直接浮在页面底色上 */
   @Builder
   mediaBox(boxW: Length, boxH: Length) {
     Stack({ alignContent: Alignment.Center }) {
@@ -930,7 +1007,7 @@ export default struct AudioPlayerPage {
     }
     .width(boxW)
     .height(boxH)
-    .backgroundColor($r('app.color.poster_bg'))
+    .backgroundColor(this.showLyrics ? Color.Transparent : $r('app.color.poster_bg'))
     .borderRadius(16)
     .clip(true)
     .onClick(() => {
@@ -987,7 +1064,7 @@ export default struct AudioPlayerPage {
   titleBlock() {
     Column({ space: 6 }) {
       Text(this.titleText.length > 0 ? this.titleText : this.currentName())
-        .fontSize(18)
+        .fontSize(this.isLandscape ? 21 : 24)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_main'))
         .maxLines(2)
@@ -995,7 +1072,7 @@ export default struct AudioPlayerPage {
         .textAlign(TextAlign.Center)
         .width('100%')
       Text(this.subText())
-        .fontSize(12)
+        .fontSize(13)
         .fontColor($r('app.color.text_secondary'))
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -1131,13 +1208,10 @@ export default struct AudioPlayerPage {
         if (this.isLandscape) {
           Row({ space: 16 }) {
             Column() {
-              if (this.showLyrics) {
-                this.mediaBox('100%', '100%')
-              } else {
-                this.mediaBox(180, 180)
-              }
+              // 横屏：海报与歌词共用同一块媒体区（同宽同高），切换时布局不跳变
+              this.mediaBox('100%', '100%')
             }
-            .width(this.showLyrics ? 280 : 200)
+            .width('56%')
             .height('100%')
             .justifyContent(FlexAlign.Center)
 
@@ -1194,14 +1268,6 @@ export default struct AudioPlayerPage {
       })
       .gesture(
         GestureGroup(GestureMode.Exclusive,
-          PanGesture({ direction: PanDirection.Up, distance: 30 })
-            .onActionEnd(() => {
-              this.switchTrack(1);
-            }),
-          PanGesture({ direction: PanDirection.Down, distance: 30 })
-            .onActionEnd(() => {
-              this.switchTrack(-1);
-            }),
           PanGesture({ direction: PanDirection.Right, distance: 30 })
             .onActionEnd(() => {
               this.seekBy(10000);

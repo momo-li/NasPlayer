@@ -4,6 +4,13 @@ import { BrowserParams, ImageViewerParams, PlayerParams, AudioPlayerParams } fro
 import { SmbService } from '../service/SmbService';
 import { MediaUtil } from '../service/MediaUtil';
 
+/** 列表排序字段 */
+enum SortKey {
+  Name = 0,
+  Time = 1,
+  Size = 2
+}
+
 class VideoDataSource implements IDataSource {
   private data: VideoEntry[] = [];
   private listeners: DataChangeListener[] = [];
@@ -99,12 +106,15 @@ struct VideoCell {
   }
 
   private metaText(): string {
-    if (this.isDir) {
-      return '文件夹';
-    }
     const parts: string[] = [];
-    parts.push(MediaUtil.formatSize(this.fileSize));
-    parts.push(MediaUtil.formatTime(this.modifiedTime));
+    if (this.isDir) {
+      parts.push('文件夹');
+    } else {
+      parts.push(MediaUtil.formatSize(this.fileSize));
+    }
+    if (this.modifiedTime > 0) {
+      parts.push(MediaUtil.formatTime(this.modifiedTime));
+    }
     return parts.join('  ·  ');
   }
 }
@@ -114,6 +124,20 @@ export default struct BrowserPage {
   params: BrowserParams = { sharePath: '' };
   private navCtx: NavDestinationContext | undefined = undefined;
   private source: VideoDataSource = new VideoDataSource();
+  /** 列表滚动控制器：用于恢复各目录上次浏览位置 */
+  private listScroller: Scroller = new Scroller();
+  /** 目录路径 → 上次离开时列表首项索引 */
+  private topIndexMap: Map<string, number> = new Map<string, number>();
+  /** 当前列表显示的首项索引（随滚动更新） */
+  private curTopIndex: number = 0;
+  /** 待恢复的目标索引，< 0 表示无需恢复 */
+  private pendingRestoreIndex: number = -1;
+  private scrollAttempts: number = 0;
+  /** 当前排序字段与方向；默认 名称·升序，文件夹始终优先 */
+  @State sortKey: number = SortKey.Name;
+  @State sortAsc: boolean = true;
+  /** 当前目录的原始（未排序）列表：切换排序时复用，避免重新走 SMB */
+  private rawList: VideoEntry[] = [];
   @State currentPath: string = '';
   @State loading: boolean = false;
   @State errorText: string = '';
@@ -134,22 +158,117 @@ export default struct BrowserPage {
     this.getUIContext().getPromptAction().showToast({ message: msg });
   }
 
-  async load(path: string, force: boolean = false): Promise<void> {
-    this.loading = true;
+  /** silent=true 用于下拉刷新/删除后刷新：不切到全屏“加载中”，保持列表与 Refresh 组件在场，
+   *  否则 Refresh 会在刷新过程中被销毁，既看不到刷新动画、也拿不到刷新手势的完整状态 */
+  async load(path: string, force: boolean = false, silent: boolean = false): Promise<void> {
+    if (!silent) {
+      this.loading = true;
+    }
+    // 先记下目标路径：这样失败后的重试/刷新仍指向同一个目录，而不是停留在上一次成功的路径
+    this.currentPath = path;
     this.errorText = '';
     this.emptyText = '';
+    if (!silent) {
+      // 进入目录（含返回上级）时恢复该目录上次浏览到的位置
+      const saved = this.topIndexMap.get(path);
+      this.pendingRestoreIndex = saved !== undefined && saved > 0 ? saved : -1;
+      this.curTopIndex = 0;
+    }
     try {
       const list = await SmbService.getInstance().readdir(path, force);
-      this.currentPath = path;
-      this.source.setData(list);
+      this.rawList = list;
+      this.source.setData(BrowserPage.sortEntries(list, this.sortKey, this.sortAsc));
       if (list.length === 0) {
         this.emptyText = '目录为空';
+        this.pendingRestoreIndex = -1;
+      } else if (this.pendingRestoreIndex >= list.length) {
+        this.pendingRestoreIndex = list.length - 1;
       }
     } catch (e) {
       this.errorText = '加载失败，请确认连接是否正常';
+      this.pendingRestoreIndex = -1;
     } finally {
       this.loading = false;
     }
+    if (this.pendingRestoreIndex >= 0) {
+      this.restorePosition();
+    }
+  }
+
+  /** 记录当前目录的滚动位置，供下次进入（返回上级）时恢复 */
+  private rememberPosition(): void {
+    this.topIndexMap.set(this.currentPath, this.curTopIndex);
+  }
+
+  /** 排序副本：readdir 返回的是 SMB 目录缓存的数组本体，绝不能原地排序，否则会污染其他调用方 */
+  private static sortEntries(src: VideoEntry[], key: number, asc: boolean): VideoEntry[] {
+    const out: VideoEntry[] = src.slice();
+    out.sort((a: VideoEntry, b: VideoEntry): number => {
+      if (a.isDirectory !== b.isDirectory) {
+        // 文件夹始终优先，与排序字段无关
+        return a.isDirectory ? -1 : 1;
+      }
+      let d = 0;
+      if (key === SortKey.Time) {
+        d = a.modifiedTime - b.modifiedTime;
+      } else if (key === SortKey.Size) {
+        d = a.size - b.size;
+      } else {
+        d = a.name.localeCompare(b.name);
+      }
+      return asc ? d : -d;
+    });
+    return out;
+  }
+
+  /** 点击排序栏：同一字段切换升降序；换字段则用该字段的默认方向 */
+  private setSort(key: number): void {
+    if (this.sortKey === key) {
+      this.sortAsc = !this.sortAsc;
+    } else {
+      this.sortKey = key;
+      // 名称默认升序；时间/大小默认降序（新的在前、大的在前）
+      this.sortAsc = key === SortKey.Name;
+    }
+    this.applySort();
+  }
+
+  /** 重排当前目录：位置索引已被打乱，先清空“返回上级恢复位置”的缓存，再回到列表顶部 */
+  private applySort(): void {
+    this.topIndexMap.clear();
+    this.curTopIndex = 0;
+    this.pendingRestoreIndex = -1;
+    this.source.setData(BrowserPage.sortEntries(this.rawList, this.sortKey, this.sortAsc));
+    try {
+      this.listScroller.scrollToIndex(0);
+    } catch (e) {
+      hilog.warn(0x0000, 'NasPlayer', 'sort scroll to top failed: %{public}s', String(e));
+    }
+  }
+
+  /** 列表重建后恢复滚动位置；列表首帧可能尚未完成布局，失败则重试几次 */
+  private restorePosition(): void {
+    this.scrollAttempts = 0;
+    this.tryScrollToIndex(this.pendingRestoreIndex);
+  }
+
+  private tryScrollToIndex(target: number): void {
+    if (target < 0 || this.pendingRestoreIndex !== target) {
+      return;
+    }
+    try {
+      this.listScroller.scrollToIndex(target);
+    } catch (e) {
+      hilog.warn(0x0000, 'NasPlayer', 'restore scroll failed: %{public}s', String(e));
+    }
+    this.scrollAttempts++;
+    if (this.scrollAttempts >= 3) {
+      this.pendingRestoreIndex = -1;
+      return;
+    }
+    setTimeout(() => {
+      this.tryScrollToIndex(target);
+    }, 80);
   }
 
   /** 返回上级目录；无上级目录（共享根）时返回 false 让系统退出页面 */
@@ -158,6 +277,7 @@ export default struct BrowserPage {
     if (cur.length === 0) {
       return false;
     }
+    this.rememberPosition();
     const idx = cur.lastIndexOf('\\');
     // 单级目录（无 \）返回根目录；多级目录返回上一级
     const parent = idx < 0 ? '' : (idx === 0 ? '' : cur.substring(0, idx));
@@ -167,6 +287,7 @@ export default struct BrowserPage {
 
   private openEntry(entry: VideoEntry): void {
     if (entry.isDirectory) {
+      this.rememberPosition();
       this.load(entry.path);
       return;
     }
@@ -310,7 +431,7 @@ export default struct BrowserPage {
       hilog.info(0x0000, 'NasPlayer', 'delete ok path=%{public}s', target.path);
       this.actionTarget = undefined;
       this.showToast('已删除：' + target.name);
-      await this.load(this.currentPath, true);
+      await this.load(this.currentPath, true, true);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       hilog.error(0x0000, 'NasPlayer', 'delete failed path=%{public}s err=%{public}s', target.path, msg);
@@ -368,7 +489,7 @@ export default struct BrowserPage {
       hilog.info(0x0000, 'NasPlayer', 'rename ok path=%{public}s newName=%{public}s', target.path, name);
       this.renameTarget = undefined;
       this.showToast('已重命名为：' + name);
-      await this.load(this.currentPath, true);
+      await this.load(this.currentPath, true, true);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       hilog.error(0x0000, 'NasPlayer', 'rename failed path=%{public}s err=%{public}s', target.path, msg);
@@ -376,6 +497,38 @@ export default struct BrowserPage {
     } finally {
       this.renaming = false;
     }
+  }
+
+  /** 排序栏：名称/时间/大小，当前项高亮并显示升降序箭头 */
+  @Builder
+  SortBar() {
+    Row({ space: 8 }) {
+      this.SortChip('名称', SortKey.Name)
+      this.SortChip('时间', SortKey.Time)
+      this.SortChip('大小', SortKey.Size)
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 4, bottom: 8 })
+  }
+
+  @Builder
+  SortChip(label: string, key: number) {
+    Row({ space: 2 }) {
+      Text(label)
+        .fontSize(13)
+        .fontColor(this.sortKey === key ? $r('app.color.theme_primary') : $r('app.color.text_secondary'))
+      if (this.sortKey === key) {
+        Text(this.sortAsc ? '↑' : '↓')
+          .fontSize(12)
+          .fontColor($r('app.color.theme_primary'))
+      }
+    }
+    .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+    .backgroundColor(this.sortKey === key ? '#141E88E5' : $r('app.color.card_bg'))
+    .borderRadius(14)
+    .onClick(() => {
+      this.setSort(key);
+    })
   }
 
   build() {
@@ -405,60 +558,75 @@ export default struct BrowserPage {
                 .height(36)
                 .backgroundColor($r('app.color.theme_primary'))
                 .onClick(() => {
-                  this.load(this.currentPath);
+                  this.load(this.currentPath, true, true);
                 })
             }
             .width('100%')
             .height('100%')
             .justifyContent(FlexAlign.Center)
           } else if (this.emptyText.length > 0) {
-            Column() {
+            Column({ space: 10 }) {
               Text(this.emptyText)
                 .fontSize(14)
                 .fontColor($r('app.color.text_secondary'))
+              Button('刷新')
+                .fontSize(14)
+                .height(36)
+                .backgroundColor($r('app.color.theme_primary'))
+                .onClick(() => {
+                  this.load(this.currentPath, true, true);
+                })
             }
             .width('100%')
             .height('100%')
             .justifyContent(FlexAlign.Center)
           } else {
-            Refresh({ refreshing: $$this.refreshing }) {
-              List({ space: 8 }) {
-                LazyForEach(this.source, (item: VideoEntry) => {
-                  ListItem() {
-                    VideoCell({
-                      path: item.path,
-                      name: item.name,
-                      fileSize: item.size,
-                      isDir: item.isDirectory,
-                      modifiedTime: item.modifiedTime
-                    })
-                  }
-                  .onClick(() => {
-                    this.openEntry(item);
-                  })
-                  .gesture(
-                    LongPressGesture({ repeat: false, duration: 500 })
-                      .onAction(() => {
-                        if (!this.deleting && !this.renaming) {
-                          this.actionTarget = item;
-                        }
+            Column() {
+              this.SortBar()
+              Refresh({ refreshing: $$this.refreshing }) {
+                List({ space: 8, scroller: this.listScroller }) {
+                  LazyForEach(this.source, (item: VideoEntry) => {
+                    ListItem() {
+                      VideoCell({
+                        path: item.path,
+                        name: item.name,
+                        fileSize: item.size,
+                        isDir: item.isDirectory,
+                        modifiedTime: item.modifiedTime
                       })
-                  )
-                }, (item: VideoEntry) => item.path)
+                    }
+                    .onClick(() => {
+                      this.openEntry(item);
+                    })
+                    .gesture(
+                      LongPressGesture({ repeat: false, duration: 500 })
+                        .onAction(() => {
+                          if (!this.deleting && !this.renaming) {
+                            this.actionTarget = item;
+                          }
+                        })
+                    )
+                  }, (item: VideoEntry) => item.path)
+                }
+                .padding({ left: 14, right: 14, bottom: 14 })
+                .width('100%')
+                .layoutWeight(1)
+                .scrollBar(BarState.Off)
+                .onScrollIndex((first: number) => {
+                  this.curTopIndex = first;
+                })
               }
-              .padding({ left: 14, right: 14, bottom: 14 })
-              .width('100%')
+              .onRefreshing(() => {
+                this.refreshing = true;
+                this.load(this.currentPath, true, true).finally(() => {
+                  this.refreshing = false;
+                });
+              })
               .layoutWeight(1)
-              .scrollBar(BarState.Off)
+              .width('100%')
             }
-            .onRefreshing(() => {
-              this.refreshing = true;
-              this.load(this.currentPath, true).finally(() => {
-                this.refreshing = false;
-              });
-            })
-            .layoutWeight(1)
             .width('100%')
+            .layoutWeight(1)
           }
         }
         .width('100%')

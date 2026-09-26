@@ -46,8 +46,11 @@ export default struct ShareListPage {
     return out;
   }
 
-  async load(force: boolean = false): Promise<void> {
-    this.loading = true;
+  /** silent=true 用于下拉刷新：不切到全屏“加载中”，保持列表与 Refresh 组件在场，刷新动画与手势状态才正常 */
+  async load(force: boolean = false, silent: boolean = false): Promise<void> {
+    if (!silent) {
+      this.loading = true;
+    }
     this.errorText = '';
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -192,7 +195,7 @@ export default struct ShareListPage {
           }
           .onRefreshing(() => {
             this.refreshing = true;
-            this.load(true).finally(() => {
+            this.load(true, true).finally(() => {
               this.refreshing = false;
             });
           })

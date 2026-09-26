@@ -1,8 +1,9 @@
-import { SmbClient } from './SmbClient';
+import { SmbClient, SmbError } from './SmbClient';
 import { QueryEntry } from './SmbPacket';
 import { VideoEntry } from '../model/VideoEntry';
 import { SmbConfig } from '../model/SmbConfig';
 import { ShareEntry } from '../model/ShareEntry';
+import { NetUtil } from '../service/NetUtil';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const DOMAIN = 0x0000;
@@ -62,18 +63,50 @@ export class SmbSession {
 
   private async connectWithConfig(host: string, share: string, username: string, password: string,
     domain: string, port: number): Promise<void> {
-    const client = new SmbClient();
-    await client.connect(host, share, username, password, domain, port);
-    this.client = client;
-    const cfg: SmbConfig = {
-      host: host,
-      port: port,
-      share: share,
-      username: username,
-      password: password,
-      domain: domain
-    };
-    this.config = cfg;
+    // 主机名可能解析出多个地址（如同时有 IPv4/IPv6，或 DDNS 返回多条）：
+    // 逐个做「完整 SMB 建连」。只认第一个 TCP 能通的地址，会在该地址其实不可用时直接失败——
+    // 这是“以前能用主机名连、现在连不上”的典型原因（DNS 多出一条不可达的 IPv6 记录）。
+    const candidates = await NetUtil.resolve(host);
+    const dnsResolved = NetUtil.hasResolvedAddress(host, candidates);
+    let lastError: Error = new Error('无法连接主机 ' + host);
+    for (let i = 0; i < candidates.length; i++) {
+      const addr = candidates[i].address;
+      const client = new SmbClient();
+      try {
+        await client.connect(addr, share, username, password, domain, port);
+        this.client = client;
+        const cfg: SmbConfig = {
+          host: host,
+          port: port,
+          share: share,
+          username: username,
+          password: password,
+          domain: domain
+        };
+        this.config = cfg;
+        if (addr !== host) {
+          hilog.info(DOMAIN, TAG, 'connected via resolved %{public}s (host=%{public}s)', addr, host);
+        }
+        return;
+      } catch (e) {
+        lastError = e instanceof Error ? e : new Error('无法连接主机 ' + host);
+        hilog.warn(DOMAIN, TAG, 'candidate %{public}s failed: %{public}s', addr, lastError.message);
+        try {
+          await client.disconnect();
+        } catch (e2) {
+          hilog.debug(DOMAIN, TAG, 'disconnect failed candidate %{public}s', addr);
+        }
+        // 已经收到 SMB 应答（账号/权限/共享问题）说明这个地址是通的，换地址也不会变好，直接上报
+        if (e instanceof SmbError) {
+          throw lastError;
+        }
+      }
+    }
+    // 全部候选失败且解析没拿到任何地址时，明确告诉调用方是“主机名解析不出来”，避免上层给出误导性提示
+    if (!(lastError instanceof SmbError) && NetUtil.familyOf(NetUtil.normalize(host)) === 0 && !dnsResolved) {
+      throw new Error('无法解析主机名 ' + NetUtil.normalize(host) + '（DNS 未返回地址）');
+    }
+    throw lastError;
   }
 
   async enumerateShares(): Promise<ShareEntry[]> {
