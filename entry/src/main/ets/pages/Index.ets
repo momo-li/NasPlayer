@@ -1,4 +1,5 @@
 import { common } from '@kit.AbilityKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { NeighborHost } from '../model/NeighborHost';
 import { AudioPlayerParams, BrowserParams, ImageViewerParams, PlayerParams, SharesParams } from '../model/RouteParams';
@@ -12,6 +13,15 @@ import BrowserPage from './BrowserPage';
 import ImageViewerPage from './ImageViewerPage';
 import PlayerPage from './PlayerPage';
 import ShareListPage from './ShareListPage';
+
+/** 去掉 SMB 错误信息里的 '[NEGOTIATE] ' 之类前缀，只保留对用户有意义的中文描述 */
+function cleanSmbMessage(msg: string): string {
+  const close = msg.indexOf(']');
+  if (msg.charAt(0) === '[' && close > 0) {
+    return msg.substring(close + 1).trim();
+  }
+  return msg;
+}
 
 @Entry
 @Component
@@ -126,27 +136,23 @@ struct Index {
       const p: SharesParams = { host: host };
       this.pathStack.pushPathByName('Shares', p);
     } catch (e) {
+      const target = NetUtil.normalize(host);
+      // BusinessError 是 interface（不能 instanceof），按官方示例用 as 取 code
+      const be = e as BusinessError;
+      let code = 0;
+      if (be !== undefined && be !== null && be.code !== undefined) {
+        code = be.code;
+      }
       const errMsg = e instanceof Error ? e.message : String(e);
       const errStack = e instanceof Error && e.stack !== undefined ? e.stack : '';
-      hilog.error(0x0000, 'NasPlayer', 'connect failed, host=%{public}s, err=%{public}s, stack=%{public}s',
-        host, errMsg, errStack);
+      hilog.error(0x0000, 'NasPlayer', 'connect failed host=%{public}s code=%{public}d err=%{public}s stack=%{public}s',
+        target, code, errMsg, errStack);
       if (e instanceof SmbError) {
-        this.showToast('连接失败：' + e.message);
+        // TCP 已通、SMB 层失败：问题在协议协商/账号密码/共享权限
+        this.showToast('连接失败：' + cleanSmbMessage(errMsg));
       } else {
-        const msg = errMsg;
-        if (msg.indexOf('超时') >= 0) {
-          this.showToast('连接超时：主机无响应，请检查网络');
-        } else if (msg.indexOf('断开') >= 0 || msg.indexOf('closed') >= 0) {
-          this.showToast('连接被中断：服务器拒绝了连接');
-        } else if (msg.indexOf('ipv6') >= 0 || msg.indexOf('unreachable') >= 0 || msg.indexOf('2303200') >= 0) {
-          this.showToast('IPv6 连接失败：请确认地址与作用域（如 fe80::1%wlan0），或改用 IPv4/主机名');
-        } else if (msg.indexOf('connect') >= 0 || msg.indexOf('socket') >= 0) {
-          this.showToast('无法连接主机（' + msg + '），请确认手机与主机在同一网络');
-        } else if (msg.length > 0) {
-          this.showToast('连接失败：' + msg);
-        } else {
-          this.showToast('连接失败，请检查网络或账号密码');
-        }
+        // 网络层失败：按“主机名 / IP”和错误码给出可行动的提示，而不是笼统说“检查同一网络”
+        this.showToast(NetUtil.describeConnectError(target, errMsg, code));
       }
     } finally {
       this.connecting = false;
