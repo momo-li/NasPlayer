@@ -89,6 +89,12 @@ export default struct PlayerPage {
     if (p === undefined) {
       return;
     }
+    // videoScaleType 只能在 prepared/playing/paused/completed 下设置：
+    // 加载阶段（onAreaChange 早触发）设置会抛 5400102 并误触 on('error')
+    const st = p.state;
+    if (st !== 'prepared' && st !== 'playing' && st !== 'paused' && st !== 'completed') {
+      return;
+    }
     // 横竖屏统一遵循用户选择的缩放模式（适应/裁剪）
     const type: media.VideoScaleType = this.scaleValues[this.scaleIdx];
     try {
@@ -470,7 +476,14 @@ export default struct PlayerPage {
       player.surfaceId = this.surfaceId;
       // prepare 加超时保护：网络瞬断（如 USB 连接导致 Wi-Fi 闪断）时避免无限卡加载
       await this.prepareWithTimeout(player, 10000);
+      // prepare() 的 Promise 会早于 stateChange('prepared') 抵达主线程（实测早约 60ms），
+      // 此刻 player.state 仍是 initialized。若在 initialized 下设置 videoScaleType / 调 play()，
+      // AVPlayer 会抛 5400102（Operate Not Permit）导致本次播放直接失败——大文件 prepare 越久越必现。
+      const prepared = await this.waitForState(player, 'prepared', 5000);
       hilog.info(0x0000, 'NasPlayer', 'playEntry: prepared, state=%{public}s', player.state);
+      if (!prepared) {
+        throw new Error(player.state === 'error' ? '视频源准备失败' : '视频准备超时');
+      }
       this.updateScale();
       this.duration = player.duration;
       if (this.resumePosition > 0) {

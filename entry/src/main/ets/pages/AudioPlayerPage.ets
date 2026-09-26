@@ -176,6 +176,12 @@ export default struct AudioPlayerPage {
       }
       // 音频播放无需设置 surfaceId
       await this.prepareWithTimeout(player, 10000);
+      // 与视频同理：prepare() 的 Promise 可能早于 stateChange('prepared')，
+      // 在 initialized 下 play() 会抛 5400102
+      const prepared = await this.waitForState(player, 'prepared', 5000);
+      if (!prepared) {
+        throw new Error(player.state === 'error' ? '音频源准备失败' : '音频准备超时');
+      }
       this.duration = player.duration;
       if (this.speedIdx !== 1) {
         player.setSpeed(this.speedValues[this.speedIdx]);
