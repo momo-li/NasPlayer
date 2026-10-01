@@ -67,6 +67,16 @@ export class ImageLoader {
     }
   }
 
+  /** 删除单个缓存项（不释放 PixelMap：可能仍被正在渲染的 ImageCell 持有） */
+  evict(path: string): void {
+    this.cache.delete(path);
+    const idx = this.keyOrder.indexOf(path);
+    if (idx >= 0) {
+      this.keyOrder.splice(idx, 1);
+    }
+    this.pending.delete(path);
+  }
+
   /** 页面退出：清空引用并拒绝后续加载；不做显式 release，避免释放仍被渲染的 PixelMap */
   clear(): void {
     this.closed = true;

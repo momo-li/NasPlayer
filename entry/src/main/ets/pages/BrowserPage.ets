@@ -3,6 +3,7 @@ import { VideoEntry } from '../model/VideoEntry';
 import { BrowserParams, ImageViewerParams, PlayerParams, AudioPlayerParams } from '../model/RouteParams';
 import { SmbService } from '../service/SmbService';
 import { MediaUtil } from '../service/MediaUtil';
+import { consumeDirDirty } from '../service/DeleteUtil';
 
 /** 列表排序字段 */
 enum SortKey {
@@ -149,6 +150,8 @@ export default struct BrowserPage {
   @State renameTarget: VideoEntry | undefined = undefined;
   @State renameText: string = '';
   @State renaming: boolean = false;
+  /** 首次展示由 aboutToAppear 负责加载，避免 onShown 重复加载 */
+  private firstShown: boolean = true;
 
   aboutToAppear(): void {
     this.load(this.params.sharePath);
@@ -772,6 +775,16 @@ export default struct BrowserPage {
     })
     .onReady((ctx: NavDestinationContext) => {
       this.navCtx = ctx;
+    })
+    .onShown(() => {
+      if (this.firstShown) {
+        this.firstShown = false;
+        return;
+      }
+      // 播放/查看页删除过文件：静默刷新当前目录，保留列表与滚动位置
+      if (consumeDirDirty(this.currentPath)) {
+        this.load(this.currentPath, true, true);
+      }
     })
   }
 }

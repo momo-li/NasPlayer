@@ -8,6 +8,8 @@ import { VideoEntry } from '../model/VideoEntry';
 import { PlayerParams } from '../model/RouteParams';
 import { StreamServer } from '../service/StreamServer';
 import { MediaUtil } from '../service/MediaUtil';
+import { SmbService } from '../service/SmbService';
+import { showDeleteConfirm, parentDir, markDirDirty } from '../service/DeleteUtil';
 
 /** 起播后延迟多久开始预热相邻视频：太早会和刚起播的流抢带宽，太晚则来不及 */
 const NEIGHBOR_PREFETCH_DELAY_MS = 2500;
@@ -56,6 +58,9 @@ export default struct PlayerPage {
   /** 播放器可视区域宽度（vp，用于把亮度弹窗贴到屏幕左侧） */
   @State screenWidth: number = 0;
   private safeAreaListening: boolean = false;
+  private navCtx: NavDestinationContext | undefined = undefined;
+  @State deleting: boolean = false;
+  @State actionMenuOpen: boolean = false;
 
   private scaleValues: media.VideoScaleType[] = [
     media.VideoScaleType.VIDEO_SCALE_TYPE_SCALED_ASPECT,
@@ -749,6 +754,68 @@ export default struct PlayerPage {
     }
   }
 
+  /** 打开“更多”菜单：停掉控制栏自动隐藏，避免菜单打开时锚点按钮被移除 */
+  private openActionMenu(): void {
+    this.actionMenuOpen = true;
+    if (this.hideTimer >= 0) {
+      clearTimeout(this.hideTimer);
+      this.hideTimer = -1;
+    }
+  }
+
+  /** 删除当前视频：红色按钮 + 二次确认，避免误触；删除后自动切到下一部 */
+  private confirmDeleteCurrent(): void {
+    if (this.deleting || this.switchInProgress) {
+      return;
+    }
+    if (this.index < 0 || this.index >= this.videoFiles.length) {
+      return;
+    }
+    const target = this.videoFiles[this.index];
+    showDeleteConfirm(this.getUIContext(), target.name, '视频', () => {
+      this.doDeleteCurrent(target);
+    });
+  }
+
+  private async doDeleteCurrent(target: VideoEntry): Promise<void> {
+    if (this.deleting) {
+      return;
+    }
+    this.deleting = true;
+    // 先暂停，避免删除瞬间 SMB 读失败弹出播放器错误提示
+    this.pauseIfPlaying();
+    try {
+      await SmbService.getInstance().deleteEntry(target.path, false);
+      const next: VideoEntry[] = [];
+      for (let i = 0; i < this.videoFiles.length; i++) {
+        if (i !== this.index) {
+          next.push(this.videoFiles[i]);
+        }
+      }
+      this.videoFiles = next;
+      markDirDirty(parentDir(target.path));
+      this.showToast('已删除：' + target.name);
+      if (this.videoFiles.length === 0) {
+        await this.cleanup();
+        if (this.navCtx !== undefined) {
+          this.navCtx.pathStack.pop();
+        }
+        return;
+      }
+      if (this.index >= this.videoFiles.length) {
+        this.index = this.videoFiles.length - 1;
+      }
+      await this.playEntry(this.videoFiles[this.index]);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      hilog.error(0x0000, 'NasPlayer', 'delete current video failed path=%{public}s err=%{public}s',
+        target.path, msg);
+      this.showToast('删除失败：' + msg);
+    } finally {
+      this.deleting = false;
+    }
+  }
+
   private toggleControls(): void {
     if (this.controlsVisible) {
       this.controlsVisible = false;
@@ -840,6 +907,29 @@ export default struct PlayerPage {
     this.showControlsTemporarily();
   }
 
+  /** 更多操作菜单：后续新增操作项在此追加 */
+  @Builder
+  actionMenu() {
+    Column() {
+      Text('删除')
+        .fontSize(13)
+        .fontColor($r('app.color.text_error'))
+        .textAlign(TextAlign.Center)
+        .width('100%')
+        .padding({ top: 9, bottom: 9 })
+        .onClick(() => {
+          this.actionMenuOpen = false;
+          this.confirmDeleteCurrent();
+        })
+      // 后续新增操作项在此追加
+    }
+    .width(80)
+    .backgroundColor($r('app.color.card_bg'))
+    .borderRadius(10)
+    .shadow({ radius: 12, color: '#26000000', offsetX: 0, offsetY: 4 })
+    .clip(true)
+  }
+
   build() {
     NavDestination() {
       Stack({ alignContent: Alignment.Center }) {
@@ -922,6 +1012,22 @@ export default struct PlayerPage {
                 .maxLines(2)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
                 .layoutWeight(1)
+              Column({ space: 5 }) {
+                Circle().width(3).height(3).fill(Color.White)
+                Circle().width(3).height(3).fill(Color.White)
+                Circle().width(3).height(3).fill(Color.White)
+              }
+              .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+              .onClick(() => {
+                this.openActionMenu();
+              })
+              .bindMenu(this.actionMenuOpen, this.actionMenu, {
+                enableArrow: true,
+                onDisappear: () => {
+                  this.actionMenuOpen = false;
+                  this.showControlsTemporarily();
+                }
+              })
             }
             .width('100%')
             .padding({ left: 16, right: 16, top: this.topSafeHeight + 14 })
@@ -1059,6 +1165,9 @@ export default struct PlayerPage {
           this.brightnessPanel = false;
           return;
         }
+        if (this.actionMenuOpen) {
+          return;
+        }
         this.toggleControls();
       })
       .gesture(
@@ -1091,6 +1200,9 @@ export default struct PlayerPage {
     }
     .hideTitleBar(true)
     .backgroundColor($r('app.color.player_bg'))
+    .onReady((ctx: NavDestinationContext) => {
+      this.navCtx = ctx;
+    })
     .onWillDisappear(() => {
       this.onWillDisappear();
     })

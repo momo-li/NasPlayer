@@ -784,23 +784,31 @@ export class SmbPacket {
 
   static rpcNetShareEnumPdu(callId: number, host: string): Uint8Array {
     const name = SmbCrypto.utf16leEncode('\\\\' + host + '\u0000');
-    const w = new ByteWriter(104);
+    // IPv6 字面量（最长 39 字符）比 IPv4 长得多，固定 104 字节缓冲会溢出；
+    // 按实际主机名长度分配，兼容 NDR 的 4 字节对齐与 \0 结尾计数
+    const chars = name.length >> 1;
+    const namePadded = (name.length + 3) & ~3;
+    const total = 72 + namePadded;
+    const w = new ByteWriter(total);
     w.u8(5);
     w.u8(0);
     w.u8(0x00);
     w.u8(0x03);
     w.u32le(0x00000010);
-    w.u16le(104);
+    w.u16le(total);
     w.u16le(0);
     w.u32le(callId);
     w.u32le(80);
     w.u16le(0);
     w.u16le(15);
     w.u32le(0x0000131a);
-    w.u32le(16);
+    w.u32le(chars);
     w.u32le(0);
-    w.u32le(16);
+    w.u32le(chars);
     w.bytes(name);
+    for (let i = name.length; i < namePadded; i++) {
+      w.u8(0);
+    }
     w.u32le(1);
     w.u32le(1);
     w.u32le(0x00007f3a);

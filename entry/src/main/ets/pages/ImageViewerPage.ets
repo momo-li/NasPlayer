@@ -5,6 +5,8 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { VideoEntry } from '../model/VideoEntry';
 import { ImageViewerParams } from '../model/RouteParams';
 import { ImageLoader, LoadedImage } from '../service/ImageLoader';
+import { SmbService } from '../service/SmbService';
+import { showDeleteConfirm, parentDir, markDirDirty } from '../service/DeleteUtil';
 
 const DOMAIN = 0x0000;
 const TAG = 'NasPlayer';
@@ -287,12 +289,15 @@ export default struct ImageViewerPage {
   private hideTimer: number = -1;
   private safeAreaListening: boolean = false;
   private startIndex: number = 0;
+  private swiperController: SwiperController = new SwiperController();
 
   @State files: VideoEntry[] = [];
   @State currentIndex: number = 0;
   @State zoomed: boolean = false;
   @State controlsVisible: boolean = true;
   @State topSafeHeight: number = 0;
+  @State deleting: boolean = false;
+  @State actionMenuOpen: boolean = false;
 
   aboutToAppear(): void {
     const p = this.params;
@@ -319,6 +324,10 @@ export default struct ImageViewerPage {
     }
     this.exitImmersive();
     this.loader.clear();
+  }
+
+  private showToast(msg: string): void {
+    this.getUIContext().getPromptAction().showToast({ message: msg });
   }
 
   private enterImmersive(): void {
@@ -436,6 +445,72 @@ export default struct ImageViewerPage {
     }
   }
 
+  /** 打开“更多”菜单：停掉控制栏自动隐藏，避免菜单打开时锚点按钮被移除 */
+  private openActionMenu(): void {
+    this.actionMenuOpen = true;
+    if (this.hideTimer >= 0) {
+      clearTimeout(this.hideTimer);
+      this.hideTimer = -1;
+    }
+  }
+
+  /** 删除当前图片：红色按钮 + 二次确认，避免误触；删除后自动显示下一张 */
+  private confirmDeleteCurrent(): void {
+    if (this.deleting) {
+      return;
+    }
+    if (this.currentIndex < 0 || this.currentIndex >= this.files.length) {
+      return;
+    }
+    const target = this.files[this.currentIndex];
+    showDeleteConfirm(this.getUIContext(), target.name, '图片', () => {
+      this.doDeleteCurrent(target);
+    });
+  }
+
+  private async doDeleteCurrent(target: VideoEntry): Promise<void> {
+    if (this.deleting) {
+      return;
+    }
+    this.deleting = true;
+    const removedIndex = this.currentIndex;
+    try {
+      await SmbService.getInstance().deleteEntry(target.path, false);
+      const next: VideoEntry[] = [];
+      for (let i = 0; i < this.files.length; i++) {
+        if (i !== removedIndex) {
+          next.push(this.files[i]);
+        }
+      }
+      this.files = next;
+      this.loader.evict(target.path);
+      markDirDirty(parentDir(target.path));
+      this.showToast('已删除：' + target.name);
+      if (this.files.length === 0) {
+        this.goBack();
+        return;
+      }
+      let ni = removedIndex;
+      if (ni >= this.files.length) {
+        ni = this.files.length - 1;
+      }
+      this.currentIndex = ni;
+      this.source.setData(this.files);
+      this.updateProtected();
+      this.showControlsTemporarily();
+      // 等 LazyForEach 完成重建后再跳转，避免 changeIndex 被尚未重建的子项丢弃
+      setTimeout(() => {
+        this.swiperController.changeIndex(ni, false);
+      }, 50);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      hilog.error(DOMAIN, TAG, 'delete current image failed path=%{public}s err=%{public}s', target.path, msg);
+      this.showToast('删除失败：' + msg);
+    } finally {
+      this.deleting = false;
+    }
+  }
+
   private goBack(): void {
     const ctx = this.navCtx;
     if (ctx !== undefined) {
@@ -443,10 +518,33 @@ export default struct ImageViewerPage {
     }
   }
 
+  /** 更多操作菜单：后续新增操作项在此追加 */
+  @Builder
+  actionMenu() {
+    Column() {
+      Text('删除')
+        .fontSize(13)
+        .fontColor($r('app.color.text_error'))
+        .textAlign(TextAlign.Center)
+        .width('100%')
+        .padding({ top: 9, bottom: 9 })
+        .onClick(() => {
+          this.actionMenuOpen = false;
+          this.confirmDeleteCurrent();
+        })
+      // 后续新增操作项在此追加
+    }
+    .width(80)
+    .backgroundColor($r('app.color.card_bg'))
+    .borderRadius(10)
+    .shadow({ radius: 12, color: '#26000000', offsetX: 0, offsetY: 4 })
+    .clip(true)
+  }
+
   build() {
     NavDestination() {
       Stack({ alignContent: Alignment.Top }) {
-        Swiper() {
+        Swiper(this.swiperController) {
           LazyForEach(this.source, (item: VideoEntry) => {
             ImageCell({
               path: item.path,
@@ -457,7 +555,7 @@ export default struct ImageViewerPage {
             })
           }, (item: VideoEntry) => item.path)
         }
-        .index(this.startIndex)
+        .index($$this.currentIndex)
         .vertical(true)
         .loop(false)
         .indicator(false)
@@ -496,6 +594,22 @@ export default struct ImageViewerPage {
             }
             .alignItems(HorizontalAlign.Start)
             .layoutWeight(1)
+            Column({ space: 5 }) {
+              Circle().width(3).height(3).fill(Color.White)
+              Circle().width(3).height(3).fill(Color.White)
+              Circle().width(3).height(3).fill(Color.White)
+            }
+            .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+            .onClick(() => {
+              this.openActionMenu();
+            })
+            .bindMenu(this.actionMenuOpen, this.actionMenu, {
+              enableArrow: true,
+              onDisappear: () => {
+                this.actionMenuOpen = false;
+                this.showControlsTemporarily();
+              }
+            })
           }
           .width('100%')
           .padding({ left: 6, right: 16, top: this.topSafeHeight + 8, bottom: 10 })
@@ -507,6 +621,9 @@ export default struct ImageViewerPage {
       .backgroundColor($r('app.color.player_bg'))
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
       .onClick(() => {
+        if (this.actionMenuOpen) {
+          return;
+        }
         this.toggleControls();
       })
     }
