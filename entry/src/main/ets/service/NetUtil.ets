@@ -4,6 +4,8 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 const DOMAIN = 0x0000;
 const TAG = 'NetUtil';
 const MAX_HOSTNAME_CANDIDATES = 3;
+const QUERY_RETRY = 4;
+const QUERY_RETRY_DELAY_MS = 300;
 
 export interface ResolvedAddress {
   address: string;
@@ -222,8 +224,8 @@ export class NetUtil {
       out.push(only);
       return out;
     }
-    try {
-      const list = await connection.getAddressesByName(h);
+    const list = await NetUtil.queryAddresses(h);
+    if (list !== undefined) {
       const v6: ResolvedAddress[] = [];
       const v4: ResolvedAddress[] = [];
       for (let i = 0; i < list.length; i++) {
@@ -239,7 +241,7 @@ export class NetUtil {
           v4.push(item);
         }
       }
-      // IPv4 优先：公网 445 与多数家庭/NAS 网络只走 IPv4，IPv6 作为备选，避免先卡在不可达的 IPv6 上
+      // IPv4 优先：多数家庭/NAS 网络只走 IPv4，IPv6 作为备选，避免先卡在不可达的 IPv6 上
       const merged = v4.concat(v6);
       const count = Math.min(merged.length, MAX_HOSTNAME_CANDIDATES);
       for (let i = 0; i < count; i++) {
@@ -247,8 +249,6 @@ export class NetUtil {
       }
       hilog.info(DOMAIN, TAG, 'resolve %{public}s -> v4=%{public}d v6=%{public}d picked=%{public}d',
         h, v4.length, v6.length, out.length);
-    } catch (e) {
-      hilog.warn(DOMAIN, TAG, 'resolve %{public}s failed: %{public}s', h, JSON.stringify(e));
     }
     if (out.length === 0) {
       // 系统解析没结果：把主机名原样交给 NETSTACK 兜底解析
@@ -257,6 +257,49 @@ export class NetUtil {
       out.push(fallback);
     }
     return out;
+  }
+
+  /**
+   * 解析主机名。
+   * 优先用 API 23+ 的 getAddressesByNameWithOptions(AF_UNSPEC)：旧的 getAddressesByName 对
+   * 「只有 AAAA 记录、没有 A 记录」的域名（如 IPv6-only 的 DDNS）会返回 2100002 服务异常，
+   * 导致 IPv6-only 主机名解析不出来。失败时退回旧的 getAddressesByName，并对服务的瞬时异常重试。
+   */
+  private static async queryAddresses(host: string): Promise<connection.NetAddress[] | undefined> {
+    let lastErr: string = '';
+    for (let attempt = 0; attempt < QUERY_RETRY; attempt++) {
+      try {
+        const opts: connection.QueryOptions = { family: connection.FamilyType.FAMILY_TYPE_ALL };
+        const all = await connection.getAddressesByNameWithOptions(host, opts);
+        if (all.length > 0) {
+          return all;
+        }
+      } catch (e) {
+        lastErr = JSON.stringify(e);
+      }
+      try {
+        const legacy = await connection.getAddressesByName(host);
+        if (legacy.length > 0) {
+          return legacy;
+        }
+      } catch (e) {
+        lastErr = JSON.stringify(e);
+      }
+      if (attempt + 1 < QUERY_RETRY) {
+        // 递增退避：netmanager 服务在应用刚启动时的瞬时不可用（2100002）通常几百毫秒~2 秒内恢复
+        await NetUtil.delay(QUERY_RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+    hilog.warn(DOMAIN, TAG, 'resolve %{public}s failed: %{public}s', host, lastErr);
+    return undefined;
+  }
+
+  private static delay(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        resolve();
+      }, ms);
+    });
   }
 
   /** 是否拿到了真正解析出来的地址（而不是原样主机名兜底） */
