@@ -8,6 +8,12 @@ export class MediaUtil {
   /** AVPlayer 支持的音频格式：M4A、AAC、MP3、OGG、WAV、FLAC、AMR */
   private static readonly AUDIO_EXTS: string[] = ['mp3', 'm4a', 'aac', 'wav', 'ogg', 'oga', 'flac', 'amr'];
 
+  /** 可只读查看的文本类后缀：纯文本/文档/配置/常见代码/字幕 */
+  private static readonly TEXT_EXTS: string[] = ['txt', 'text', 'log', 'md', 'markdown', 'json', 'xml',
+    'csv', 'tsv', 'ini', 'conf', 'cfg', 'yaml', 'yml', 'properties', 'srt', 'ass', 'lrc', 'js', 'ts',
+    'ets', 'mjs', 'cjs', 'html', 'htm', 'css', 'java', 'kt', 'py', 'c', 'h', 'cpp', 'hpp', 'cc', 'sh',
+    'bat', 'cmd', 'ps1', 'sql', 'gradle', 'toml', 'rst', 'gitignore', 'env'];
+
   static isVideo(name: string): boolean {
     const idx = name.lastIndexOf('.');
     if (idx < 0 || idx === name.length - 1) {
@@ -33,6 +39,15 @@ export class MediaUtil {
     }
     const ext = name.substring(idx + 1).toLowerCase();
     return MediaUtil.AUDIO_EXTS.indexOf(ext) >= 0;
+  }
+
+  static isText(name: string): boolean {
+    const idx = name.lastIndexOf('.');
+    if (idx < 0 || idx === name.length - 1) {
+      return false;
+    }
+    const ext = name.substring(idx + 1).toLowerCase();
+    return MediaUtil.TEXT_EXTS.indexOf(ext) >= 0;
   }
 
   static contentType(path: string): string {

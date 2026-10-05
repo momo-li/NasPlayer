@@ -1,6 +1,6 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { VideoEntry } from '../model/VideoEntry';
-import { BrowserParams, ImageViewerParams, PlayerParams, AudioPlayerParams } from '../model/RouteParams';
+import { BrowserParams, ImageViewerParams, PlayerParams, AudioPlayerParams, TextFileParams } from '../model/RouteParams';
 import { SmbService } from '../service/SmbService';
 import { MediaUtil } from '../service/MediaUtil';
 import { consumeDirDirty } from '../service/DeleteUtil';
@@ -318,6 +318,10 @@ export default struct BrowserPage {
       this.openAudios(entry);
       return;
     }
+    if (MediaUtil.isText(entry.name)) {
+      this.openTextFile(entry);
+      return;
+    }
     if (!MediaUtil.isVideo(entry.name)) {
       this.showToast('暂不支持该文件类型');
       return;
@@ -391,6 +395,13 @@ export default struct BrowserPage {
     const p: AudioPlayerParams = { files: audios, index: index };
     if (this.navCtx !== undefined) {
       this.navCtx.pathStack.pushPathByName('AudioPlayer', p);
+    }
+  }
+
+  private openTextFile(entry: VideoEntry): void {
+    const p: TextFileParams = { path: entry.path, name: entry.name, size: entry.size };
+    if (this.navCtx !== undefined) {
+      this.navCtx.pathStack.pushPathByName('TextFile', p);
     }
   }
 
