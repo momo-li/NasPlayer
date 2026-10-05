@@ -505,6 +505,12 @@ export class SmbPacket {
     return SmbPacket.createReqWithAccess(fileName, isDirectory, 0x00010000, !isDirectory, 0x00001000);
   }
 
+  /** 删除用打开（FILE_DELETE_ON_CLOSE，自定义 DesiredAccess） */
+  static createDeleteOnCloseReqWithAccess(fileName: string, isDirectory: boolean,
+    accessMask: number): Uint8Array {
+    return SmbPacket.createReqWithAccess(fileName, isDirectory, accessMask, !isDirectory, 0x00001000);
+  }
+
   /** 删除用打开（自定义 DesiredAccess）：目录删除时部分服务端要求带 FILE_LIST_DIRECTORY(0x1)，
    *  否则仅 DELETE 的目录打开会被拒绝（表现为文件夹一律删除失败）。 */
   static createDeleteReqWithAccess(fileName: string, isDirectory: boolean,
@@ -538,6 +544,12 @@ export class SmbPacket {
   /** FILE_DISPOSITION_INFORMATION：DeletePending = true */
   static dispositionInfoBuffer(): Uint8Array {
     return new Uint8Array([1]);
+  }
+
+  /** FILE_DISPOSITION_INFORMATION_EX：DELETE(0x1) | POSIX_SEMANTICS(0x2)。
+   *  部分服务端不认类 13，只认类 64（SMB3 起），作为删除标记的补充方式。 */
+  static dispositionInfoExBuffer(): Uint8Array {
+    return new Uint8Array([3, 0, 0, 0]);
   }
 
   /** FILE_RENAME_INFORMATION：newPath 为相对共享根的完整目标路径（如 dir\new.txt） */

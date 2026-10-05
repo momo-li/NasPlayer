@@ -9,7 +9,8 @@ import { consumeDirDirty } from '../service/DeleteUtil';
 enum SortKey {
   Name = 0,
   Time = 1,
-  Size = 2
+  Size = 2,
+  Type = 3
 }
 
 class VideoDataSource implements IDataSource {
@@ -216,6 +217,12 @@ export default struct BrowserPage {
         d = a.modifiedTime - b.modifiedTime;
       } else if (key === SortKey.Size) {
         d = a.size - b.size;
+      } else if (key === SortKey.Type) {
+        // 按扩展名归类；同类型再按名称升序，保证顺序稳定
+        d = BrowserPage.extOf(a.name).localeCompare(BrowserPage.extOf(b.name));
+        if (d === 0) {
+          d = a.name.localeCompare(b.name);
+        }
       } else {
         d = a.name.localeCompare(b.name);
       }
@@ -224,14 +231,23 @@ export default struct BrowserPage {
     return out;
   }
 
+  /** 取扩展名（不含点，统一小写）；无扩展名返回空串，排在最前 */
+  private static extOf(name: string): string {
+    const idx = name.lastIndexOf('.');
+    if (idx <= 0 || idx === name.length - 1) {
+      return '';
+    }
+    return name.substring(idx + 1).toLowerCase();
+  }
+
   /** 点击排序栏：同一字段切换升降序；换字段则用该字段的默认方向 */
   private setSort(key: number): void {
     if (this.sortKey === key) {
       this.sortAsc = !this.sortAsc;
     } else {
       this.sortKey = key;
-      // 名称默认升序；时间/大小默认降序（新的在前、大的在前）
-      this.sortAsc = key === SortKey.Name;
+      // 名称/类型默认升序；时间/大小默认降序（新的在前、大的在前）
+      this.sortAsc = key === SortKey.Name || key === SortKey.Type;
     }
     this.applySort();
   }
@@ -502,13 +518,14 @@ export default struct BrowserPage {
     }
   }
 
-  /** 排序栏：名称/时间/大小，当前项高亮并显示升降序箭头 */
+  /** 排序栏：名称/时间/大小/类型，当前项高亮并显示升降序箭头 */
   @Builder
   SortBar() {
     Row({ space: 8 }) {
       this.SortChip('名称', SortKey.Name)
       this.SortChip('时间', SortKey.Time)
       this.SortChip('大小', SortKey.Size)
+      this.SortChip('类型', SortKey.Type)
     }
     .width('100%')
     .padding({ left: 14, right: 14, top: 4, bottom: 8 })
