@@ -14,6 +14,9 @@ export class MediaUtil {
     'ets', 'mjs', 'cjs', 'html', 'htm', 'css', 'java', 'kt', 'py', 'c', 'h', 'cpp', 'hpp', 'cc', 'sh',
     'bat', 'cmd', 'ps1', 'sql', 'gradle', 'toml', 'rst', 'gitignore', 'env'];
 
+  /** 可查看的 PDF 后缀 */
+  private static readonly PDF_EXTS: string[] = ['pdf'];
+
   static isVideo(name: string): boolean {
     const idx = name.lastIndexOf('.');
     if (idx < 0 || idx === name.length - 1) {
@@ -48,6 +51,15 @@ export class MediaUtil {
     }
     const ext = name.substring(idx + 1).toLowerCase();
     return MediaUtil.TEXT_EXTS.indexOf(ext) >= 0;
+  }
+
+  static isPdf(name: string): boolean {
+    const idx = name.lastIndexOf('.');
+    if (idx < 0 || idx === name.length - 1) {
+      return false;
+    }
+    const ext = name.substring(idx + 1).toLowerCase();
+    return MediaUtil.PDF_EXTS.indexOf(ext) >= 0;
   }
 
   static contentType(path: string): string {
@@ -100,6 +112,9 @@ export class MediaUtil {
     }
     if (ext === 'amr') {
       return 'audio/amr';
+    }
+    if (ext === 'pdf') {
+      return 'application/pdf';
     }
     return 'application/octet-stream';
   }

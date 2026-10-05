@@ -2,7 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { NeighborHost } from '../model/NeighborHost';
-import { AudioPlayerParams, BrowserParams, ImageViewerParams, PlayerParams, SharesParams, TextFileParams } from '../model/RouteParams';
+import { AudioPlayerParams, BrowserParams, ImageViewerParams, PdfFileParams, PlayerParams, SharesParams, TextFileParams } from '../model/RouteParams';
 import { ConfigStore } from '../service/ConfigStore';
 import { NeighborScanner } from '../service/NeighborScanner';
 import { NetUtil } from '../service/NetUtil';
@@ -11,6 +11,7 @@ import { SmbError } from '../smb/SmbClient';
 import AudioPlayerPage from './AudioPlayerPage';
 import BrowserPage from './BrowserPage';
 import ImageViewerPage from './ImageViewerPage';
+import PdfViewerPage from './PdfViewerPage';
 import PlayerPage from './PlayerPage';
 import ShareListPage from './ShareListPage';
 import TextFilePage from './TextFilePage';
@@ -237,6 +238,8 @@ struct Index {
       AudioPlayerPage({ params: param as AudioPlayerParams })
     } else if (name === 'TextFile') {
       TextFilePage({ params: param as TextFileParams })
+    } else if (name === 'PdfViewer') {
+      PdfViewerPage({ params: param as PdfFileParams })
     }
   }
 

@@ -1,6 +1,6 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { VideoEntry } from '../model/VideoEntry';
-import { BrowserParams, ImageViewerParams, PlayerParams, AudioPlayerParams, TextFileParams } from '../model/RouteParams';
+import { BrowserParams, ImageViewerParams, PlayerParams, AudioPlayerParams, TextFileParams, PdfFileParams } from '../model/RouteParams';
 import { SmbService } from '../service/SmbService';
 import { MediaUtil } from '../service/MediaUtil';
 import { consumeDirDirty } from '../service/DeleteUtil';
@@ -322,6 +322,10 @@ export default struct BrowserPage {
       this.openTextFile(entry);
       return;
     }
+    if (MediaUtil.isPdf(entry.name)) {
+      this.openPdf(entry);
+      return;
+    }
     if (!MediaUtil.isVideo(entry.name)) {
       this.showToast('暂不支持该文件类型');
       return;
@@ -402,6 +406,13 @@ export default struct BrowserPage {
     const p: TextFileParams = { path: entry.path, name: entry.name, size: entry.size };
     if (this.navCtx !== undefined) {
       this.navCtx.pathStack.pushPathByName('TextFile', p);
+    }
+  }
+
+  private openPdf(entry: VideoEntry): void {
+    const p: PdfFileParams = { path: entry.path, name: entry.name, size: entry.size };
+    if (this.navCtx !== undefined) {
+      this.navCtx.pathStack.pushPathByName('PdfViewer', p);
     }
   }
 
