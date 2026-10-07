@@ -1,6 +1,7 @@
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SmbService } from './SmbService';
+import { TextFileLoader } from './TextFileLoader';
 
 const DOMAIN = 0x0000;
 const TAG = 'NasPlayer';
@@ -406,37 +407,9 @@ export class LyricsUtil {
 
   // ---------------- 编码 ----------------
 
-  /** BOM 优先；无 BOM 时先按 UTF-8 严格解码，失败或出现替换字符再回退 GBK（NAS 上的中文 .lrc 多为 GBK） */
+  /** 复用共享解码：BOM 优先，UTF-8 严格解码失败再回退 GBK */
   private static decodeText(data: Uint8Array): string {
-    if (data.length >= 3 && data[0] === 0xEF && data[1] === 0xBB && data[2] === 0xBF) {
-      return LyricsUtil.decodeWith('utf-8', data.slice(3));
-    }
-    if (data.length >= 2 && data[0] === 0xFF && data[1] === 0xFE) {
-      return LyricsUtil.decodeWith('utf-16le', data.slice(2));
-    }
-    if (data.length >= 2 && data[0] === 0xFE && data[1] === 0xFF) {
-      return LyricsUtil.decodeWith('utf-16be', data.slice(2));
-    }
-    let text = '';
-    try {
-      const opts: util.TextDecoderOptions = { fatal: true };
-      text = util.TextDecoder.create('utf-8', opts).decodeToString(data);
-    } catch (e) {
-      text = '';
-    }
-    if (text.length > 0 && text.indexOf('\uFFFD') < 0) {
-      return text;
-    }
-    try {
-      const sd = new util.StringDecoder('gbk');
-      const gbk = sd.write(data) + sd.end();
-      if (gbk.trim().length > 0) {
-        return gbk;
-      }
-    } catch (e) {
-      hilog.warn(DOMAIN, TAG, 'lrc gbk decode failed: %{public}s', JSON.stringify(e));
-    }
-    return text;
+    return TextFileLoader.decode(data);
   }
 
   private static decodeWith(encoding: string, data: Uint8Array): string {

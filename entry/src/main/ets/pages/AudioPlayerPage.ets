@@ -11,6 +11,8 @@ import { StreamServer } from '../service/StreamServer';
 import { AudioMeta, AudioMetaUtil } from '../service/AudioMetaUtil';
 import { MediaUtil } from '../service/MediaUtil';
 import { Lyrics, LyricLine, LyricsUtil } from '../service/LyricsUtil';
+import { SmbService } from '../service/SmbService';
+import { showDeleteConfirm, parentDir, markDirDirty } from '../service/DeleteUtil';
 
 const DOMAIN = 0x0000;
 const TAG = 'NasPlayer';
@@ -67,6 +69,9 @@ export default struct AudioPlayerPage {
   /** 歌词列表实测高度，用于计算首尾留白使任意行都能居中 */
   @State lyricViewH: number = 220;
   private lyricScroller: Scroller = new Scroller();
+  private navCtx: NavDestinationContext | undefined = undefined;
+  @State deleting: boolean = false;
+  @State actionMenuOpen: boolean = false;
 
   
   private speedValues: media.PlaybackSpeed[] = [
@@ -603,6 +608,61 @@ export default struct AudioPlayerPage {
       this.loopMode = avSession.LoopMode.LOOP_MODE_SEQUENCE;
     }
     this.syncSessionState();
+  }
+
+  /** 删除当前曲目：红色按钮 + 二次确认，避免误触；删除后自动切到下一首 */
+  private confirmDeleteCurrent(): void {
+    if (this.deleting || this.switchInProgress) {
+      return;
+    }
+    const e = this.currentEntry();
+    if (e === undefined) {
+      return;
+    }
+    showDeleteConfirm(this.getUIContext(), e.name, '音频', () => {
+      this.doDeleteCurrent(e);
+    });
+  }
+
+  private async doDeleteCurrent(target: VideoEntry): Promise<void> {
+    if (this.deleting) {
+      return;
+    }
+    this.deleting = true;
+    const removedIndex = this.index;
+    try {
+      await this.pausePlayback();
+      await SmbService.getInstance().deleteEntry(target.path, false);
+      const next: VideoEntry[] = [];
+      for (let i = 0; i < this.tracks.length; i++) {
+        if (i !== removedIndex) {
+          next.push(this.tracks[i]);
+        }
+      }
+      this.tracks = next;
+      markDirDirty(parentDir(target.path));
+      this.showToast('已删除：' + target.name);
+      if (this.tracks.length === 0) {
+        if (this.navCtx !== undefined) {
+          this.navCtx.pathStack.pop();
+        }
+        return;
+      }
+      let ni = removedIndex;
+      if (ni >= this.tracks.length) {
+        ni = this.tracks.length - 1;
+      }
+      this.index = ni;
+      await this.playTrack(this.tracks[ni]);
+      // previous/nextAssetId 需按新列表重算
+      this.syncSessionMetadata();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      hilog.error(DOMAIN, TAG, 'delete current audio failed path=%{public}s err=%{public}s', target.path, msg);
+      this.showToast('删除失败：' + msg);
+    } finally {
+      this.deleting = false;
+    }
   }
 
   private onSliderChange(v: number, m: SliderChangeMode): void {
@@ -1202,9 +1262,32 @@ export default struct AudioPlayerPage {
     .width('100%')
   }
 
+  /** 更多操作菜单：后续新增操作项在此追加 */
+  @Builder
+  actionMenu() {
+    Column() {
+      Text('删除')
+        .fontSize(13)
+        .fontColor($r('app.color.text_error'))
+        .textAlign(TextAlign.Center)
+        .width('100%')
+        .padding({ top: 9, bottom: 9 })
+        .onClick(() => {
+          this.actionMenuOpen = false;
+          this.confirmDeleteCurrent();
+        })
+      // 后续新增操作项在此追加
+    }
+    .width(80)
+    .backgroundColor($r('app.color.card_bg'))
+    .borderRadius(10)
+    .shadow({ radius: 12, color: '#26000000', offsetX: 0, offsetY: 4 })
+    .clip(true)
+  }
+
   build() {
     NavDestination() {
-      Stack() {
+      Stack({ alignContent: Alignment.Top }) {
         if (this.isLandscape) {
           Row({ space: 16 }) {
             Column() {
@@ -1229,7 +1312,7 @@ export default struct AudioPlayerPage {
           }
           .width('100%')
           .height('100%')
-          .padding({ left: 16, right: 16 })
+          .padding({ left: 16, right: 16, top: 52 })
         } else {
           Column({ space: 14 }) {
             if (this.showLyrics) {
@@ -1250,8 +1333,37 @@ export default struct AudioPlayerPage {
           }
           .width('100%')
           .height('100%')
-          .padding({ top: 26, bottom: 12 })
+          .padding({ top: 56, bottom: 12 })
         }
+
+        // 顶部栏：与视频播放一致（左侧歌名，右侧“更多”）
+        Row({ space: 10 }) {
+          Text(this.titleText.length > 0 ? this.titleText : this.currentName())
+            .fontSize(13)
+            .fontColor($r('app.color.text_main'))
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+          Column({ space: 5 }) {
+            Circle().width(3).height(3).fill($r('app.color.text_main'))
+            Circle().width(3).height(3).fill($r('app.color.text_main'))
+            Circle().width(3).height(3).fill($r('app.color.text_main'))
+          }
+          .width(40)
+          .height(40)
+          .justifyContent(FlexAlign.Center)
+          .onClick(() => {
+            this.actionMenuOpen = true;
+          })
+          .bindMenu(this.actionMenuOpen, this.actionMenu, {
+            enableArrow: true,
+            onDisappear: () => {
+              this.actionMenuOpen = false;
+            }
+          })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 8, top: 8, bottom: 4 })
       }
       .width('100%')
       .height('100%')
@@ -1279,8 +1391,10 @@ export default struct AudioPlayerPage {
         )
       )
     }
-    .title('正在播放')
-    .hideTitleBar(false)
+    .hideTitleBar(true)
     .backgroundColor($r('app.color.theme_bg'))
+    .onReady((ctx: NavDestinationContext) => {
+      this.navCtx = ctx;
+    })
   }
 }

@@ -2,7 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { NeighborHost } from '../model/NeighborHost';
-import { AudioPlayerParams, BrowserParams, ImageViewerParams, PlayerParams, SharesParams } from '../model/RouteParams';
+import { AudioPlayerParams, BrowserParams, ImageViewerParams, PdfFileParams, PlayerParams, SharesParams, TextFileParams } from '../model/RouteParams';
 import { ConfigStore } from '../service/ConfigStore';
 import { NeighborScanner } from '../service/NeighborScanner';
 import { NetUtil } from '../service/NetUtil';
@@ -11,8 +11,10 @@ import { SmbError } from '../smb/SmbClient';
 import AudioPlayerPage from './AudioPlayerPage';
 import BrowserPage from './BrowserPage';
 import ImageViewerPage from './ImageViewerPage';
+import PdfViewerPage from './PdfViewerPage';
 import PlayerPage from './PlayerPage';
 import ShareListPage from './ShareListPage';
+import TextFilePage from './TextFilePage';
 
 /** 去掉 SMB 错误信息里的 '[NEGOTIATE] ' 之类前缀，只保留对用户有意义的中文描述 */
 function cleanSmbMessage(msg: string): string {
@@ -234,6 +236,10 @@ struct Index {
       ImageViewerPage({ params: param as ImageViewerParams })
     } else if (name === 'AudioPlayer') {
       AudioPlayerPage({ params: param as AudioPlayerParams })
+    } else if (name === 'TextFile') {
+      TextFilePage({ params: param as TextFileParams })
+    } else if (name === 'PdfViewer') {
+      PdfViewerPage({ params: param as PdfFileParams })
     }
   }
 

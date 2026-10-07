@@ -75,6 +75,18 @@ export class ConfigStore {
     return store.getSync('last_host', '') as string;
   }
 
+  /** 视频后台播放开关（退到后台/锁屏后是否继续播放声音），默认开启 */
+  static async saveVideoBgPlay(context: common.UIAbilityContext, on: boolean): Promise<void> {
+    const store = preferences.getPreferencesSync(context, { name: PREFS_NAME });
+    store.putSync('video_bg_play', on);
+    await store.flush();
+  }
+
+  static async loadVideoBgPlay(context: common.UIAbilityContext): Promise<boolean> {
+    const store = preferences.getPreferencesSync(context, { name: PREFS_NAME });
+    return store.getSync('video_bg_play', true) as boolean;
+  }
+
   static async saveShares(context: common.UIAbilityContext, host: string,
     shares: ShareEntry[]): Promise<void> {
     const store = preferences.getPreferencesSync(context, { name: PREFS_NAME });

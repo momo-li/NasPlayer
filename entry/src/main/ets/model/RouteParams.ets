@@ -19,6 +19,18 @@ export interface AudioPlayerParams {
   index: number;
 }
 
+export interface TextFileParams {
+  path: string;
+  name: string;
+  size: number;
+}
+
+export interface PdfFileParams {
+  path: string;
+  name: string;
+  size: number;
+}
+
 export interface SharesParams {
   host: string;
 }
