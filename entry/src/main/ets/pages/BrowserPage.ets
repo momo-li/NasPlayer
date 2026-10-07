@@ -318,6 +318,10 @@ export default struct BrowserPage {
       this.openAudios(entry);
       return;
     }
+    if (MediaUtil.isVideo(entry.name)) {
+      this.openVideo(entry);
+      return;
+    }
     if (MediaUtil.isText(entry.name)) {
       this.openTextFile(entry);
       return;
@@ -326,10 +330,10 @@ export default struct BrowserPage {
       this.openPdf(entry);
       return;
     }
-    if (!MediaUtil.isVideo(entry.name)) {
-      this.showToast('暂不支持该文件类型');
-      return;
-    }
+    this.showToast('暂不支持该文件类型');
+  }
+
+  private openVideo(entry: VideoEntry): void {
     const videos: VideoEntry[] = [];
     for (let i = 0; i < this.source.totalCount(); i++) {
       const item = this.source.getData(i);

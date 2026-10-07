@@ -1,7 +1,9 @@
 import { media } from '@kit.MediaKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { window, display } from '@kit.ArkUI';
-import { common } from '@kit.AbilityKit';
+import { common, wantAgent, Want, WantAgent } from '@kit.AbilityKit';
+import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
+import { avSession } from '@kit.AVSessionKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { settings } from '@kit.BasicServicesKit';
 import { VideoEntry } from '../model/VideoEntry';
@@ -9,7 +11,15 @@ import { PlayerParams } from '../model/RouteParams';
 import { StreamServer } from '../service/StreamServer';
 import { MediaUtil } from '../service/MediaUtil';
 import { SmbService } from '../service/SmbService';
+import { ConfigStore } from '../service/ConfigStore';
 import { showDeleteConfirm, parentDir, markDirDirty } from '../service/DeleteUtil';
+
+const DOMAIN = 0x0000;
+const TAG = 'NasPlayer';
+/** 视频后台播放的播控中心会话 tag（与音频页 NasPlayer-Audio 区分） */
+const SESSION_TAG_VIDEO = 'NasPlayer-Video';
+/** 播控中心状态同步节流间隔 */
+const SESSION_SYNC_INTERVAL_MS = 1000;
 
 /** 起播后延迟多久开始预热相邻视频：太早会和刚起播的流抢带宽，太晚则来不及 */
 const NEIGHBOR_PREFETCH_DELAY_MS = 2500;
@@ -62,6 +72,18 @@ export default struct PlayerPage {
   @State deleting: boolean = false;
   @State actionMenuOpen: boolean = false;
 
+  // ---------------- 后台听视频（后台任务 + 播控中心） ----------------
+  private session: avSession.AVSession | undefined = undefined;
+  private bgStarted: boolean = false;
+  private launchAgent: WantAgent | undefined = undefined;
+  private lastSessionSync: number = 0;
+  /** 上一次“播完”的处理时间：endOfStream 与 stateChange('completed') 双事件去重 */
+  private lastFinishAt: number = 0;
+  /** 是否处于后台（退到后台继续播放时用于播完自动续播） */
+  private backgrounded: boolean = false;
+  /** 后台播放开关：退到后台/锁屏后是否继续播放声音，默认开启 */
+  @State bgPlayEnabled: boolean = true;
+
   private scaleValues: media.VideoScaleType[] = [
     media.VideoScaleType.VIDEO_SCALE_TYPE_SCALED_ASPECT,
     media.VideoScaleType.VIDEO_SCALE_TYPE_FIT_CROP
@@ -76,6 +98,8 @@ export default struct PlayerPage {
     media.PlaybackSpeed.SPEED_FORWARD_2_00_X
   ];
   private speedLabels: string[] = ['0.75x', '1.0x', '1.25x', '1.5x', '2.0x'];
+  /** 与 speedValues 对应的数值（用于播控中心展示倍速） */
+  private speedNumbers: number[] = [0.75, 1.0, 1.25, 1.5, 2.0];
 
   aboutToAppear(): void {
     const p = this.params;
@@ -85,6 +109,17 @@ export default struct PlayerPage {
     }
     // 根据当前状态决定全屏/显示系统栏
     this.applyFullscreenState();
+    this.loadBgSetting();
+    this.setupSession();
+  }
+
+  private async loadBgSetting(): Promise<void> {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      this.bgPlayEnabled = await ConfigStore.loadVideoBgPlay(ctx);
+    } catch (e) {
+      this.bgPlayEnabled = true;
+    }
   }
 
   private updateScale(): void {
@@ -118,6 +153,12 @@ export default struct PlayerPage {
 
   onPageHide(): void {
     hilog.info(0x0000, 'NasPlayer', 'player onPageHide');
+    this.backgrounded = true;
+    if (this.bgPlayEnabled) {
+      // 后台听视频：保持播放，返回前台再同步状态（NavDestination 实际走 onHidden）
+      this.syncSessionState();
+      return;
+    }
     this.exitLandscape();
     this.exitFullscreen();
     this.pauseIfPlaying();
@@ -314,6 +355,8 @@ export default struct PlayerPage {
     hilog.info(0x0000, 'NasPlayer', 'player cleanup start, hasPlayer=%{public}s', String(this.avPlayer !== undefined));
     this.destroyed = true;
     this.setKeepScreenOn(false);
+    await this.stopBackgroundTask();
+    await this.teardownSession();
     if (this.hideTimer >= 0) {
       clearTimeout(this.hideTimer);
       this.hideTimer = -1;
@@ -364,6 +407,233 @@ export default struct PlayerPage {
     }
   }
 
+  // ---------------- 后台听视频：播控中心与后台任务 ----------------
+
+  private async setupSession(): Promise<void> {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const s = await avSession.createAVSession(ctx, SESSION_TAG_VIDEO, 'video');
+      s.on('play', () => {
+        this.resumePlayback();
+      });
+      s.on('pause', () => {
+        this.pausePlayback();
+      });
+      s.on('stop', () => {
+        this.handleSessionStop();
+      });
+      s.on('playNext', () => {
+        this.switchTo(1);
+      });
+      s.on('playPrevious', () => {
+        this.switchTo(-1);
+      });
+      s.on('seek', (time: number) => {
+        this.seekTo(time);
+      });
+      this.session = s;
+      // 点击播控中心卡片时拉起应用
+      const agent = await this.getLaunchAgent();
+      if (agent !== undefined) {
+        this.launchAgent = agent;
+        await s.setLaunchAbility(agent);
+      }
+      // 官方要求：元数据与控制命令注册完成后再 activate
+      this.syncSessionMetadata();
+      await s.activate();
+      hilog.info(DOMAIN, TAG, 'video session activated');
+      this.syncSessionState();
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'video session setup failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  private async teardownSession(): Promise<void> {
+    const s = this.session;
+    this.session = undefined;
+    if (s === undefined) {
+      return;
+    }
+    try {
+      s.off('play');
+      s.off('pause');
+      s.off('stop');
+      s.off('playNext');
+      s.off('playPrevious');
+      s.off('seek');
+      await s.deactivate();
+      await s.destroy();
+      hilog.info(DOMAIN, TAG, 'video session destroyed');
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'destroy video session failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  private async getLaunchAgent(): Promise<WantAgent | undefined> {
+    if (this.launchAgent !== undefined) {
+      return this.launchAgent;
+    }
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const want: Want = {
+        bundleName: ctx.abilityInfo.bundleName,
+        abilityName: ctx.abilityInfo.name
+      };
+      const wants: Want[] = [want];
+      const info: wantAgent.WantAgentInfo = {
+        wants: wants,
+        actionType: wantAgent.OperationType.START_ABILITY,
+        requestCode: 0,
+        actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
+      };
+      const agent: WantAgent = await wantAgent.getWantAgent(info);
+      this.launchAgent = agent;
+      return agent;
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'video get launch agent failed: %{public}s', JSON.stringify(e));
+      return undefined;
+    }
+  }
+
+  private async handleSessionStop(): Promise<void> {
+    await this.pausePlayback();
+    await this.stopBackgroundTask();
+  }
+
+  private syncSessionMetadata(): void {
+    const s = this.session;
+    if (s === undefined) {
+      return;
+    }
+    const entry = (this.index >= 0 && this.index < this.videoFiles.length) ? this.videoFiles[this.index] : undefined;
+    // 注意：可选字段不能显式传 undefined（会触发 401 参数校验失败），只设置有值的字段
+    const md: avSession.AVMetadata = {
+      assetId: entry !== undefined ? entry.path : SESSION_TAG_VIDEO,
+      title: entry !== undefined ? entry.name : '视频'
+    };
+    md.artist = '本地视频';
+    if (this.duration > 0) {
+      md.duration = this.duration;
+    }
+    // previous/nextAssetId 决定播控中心上一部/下一部按钮是否可用
+    if (this.index - 1 >= 0 && this.index - 1 < this.videoFiles.length) {
+      md.previousAssetId = this.videoFiles[this.index - 1].path;
+    }
+    if (this.index + 1 >= 0 && this.index + 1 < this.videoFiles.length) {
+      md.nextAssetId = this.videoFiles[this.index + 1].path;
+    }
+    s.setAVMetadata(md).catch((e: BusinessError) => {
+      hilog.warn(DOMAIN, TAG, 'video setAVMetadata failed code=%{public}d msg=%{public}s', e.code, e.message);
+    });
+  }
+
+  private syncSessionState(): void {
+    const s = this.session;
+    if (s === undefined) {
+      return;
+    }
+    const pos: avSession.PlaybackPosition = {
+      elapsedTime: this.currentTime,
+      updateTime: Date.now()
+    };
+    const st: avSession.AVPlaybackState = {
+      state: this.playing
+        ? avSession.PlaybackState.PLAYBACK_STATE_PLAY
+        : avSession.PlaybackState.PLAYBACK_STATE_PAUSE,
+      position: pos,
+      speed: this.speedNumbers[this.speedIdx]
+    };
+    s.setAVPlaybackState(st).catch((e: Error) => {
+      hilog.debug(DOMAIN, TAG, 'video setAVPlaybackState failed: %{public}s', JSON.stringify(e));
+    });
+  }
+
+  private async ensureBackgroundTask(): Promise<void> {
+    if (this.bgStarted || !this.bgPlayEnabled) {
+      return;
+    }
+    this.bgStarted = true;
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const agent = await this.getLaunchAgent();
+      if (agent === undefined) {
+        throw new Error('无法创建 WantAgent');
+      }
+      await backgroundTaskManager.startBackgroundRunning(ctx,
+        backgroundTaskManager.BackgroundMode.AUDIO_PLAYBACK, agent);
+      hilog.info(DOMAIN, TAG, 'video background task started');
+    } catch (e) {
+      this.bgStarted = false;
+      hilog.warn(DOMAIN, TAG, 'video background task failed: %{public}s', JSON.stringify(e));
+      this.showToast('后台播放未开启：' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  private async stopBackgroundTask(): Promise<void> {
+    if (!this.bgStarted) {
+      return;
+    }
+    this.bgStarted = false;
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      await backgroundTaskManager.stopBackgroundRunning(ctx);
+      hilog.info(DOMAIN, TAG, 'video background task stopped');
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'stop video background task failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  private async resumePlayback(): Promise<void> {
+    const p = this.avPlayer;
+    if (p === undefined) {
+      return;
+    }
+    try {
+      if (p.state === 'paused' || p.state === 'prepared' || p.state === 'completed') {
+        await p.play();
+        this.playing = true;
+        // 暂停会丢失倍速设置，恢复播放时重新应用，避免界面显示与实际播放速度不一致
+        if (this.speedIdx !== 1) {
+          p.setSpeed(this.speedValues[this.speedIdx]);
+        }
+        this.syncSessionState();
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'video resume failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  private async pausePlayback(): Promise<void> {
+    const p = this.avPlayer;
+    if (p === undefined) {
+      return;
+    }
+    try {
+      if (p.state === 'playing') {
+        await p.pause();
+        this.playing = false;
+        this.syncSessionState();
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'video pause failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  private seekTo(time: number): void {
+    const p = this.avPlayer;
+    if (p === undefined || this.duration <= 0) {
+      return;
+    }
+    const target = Math.min(Math.max(time, 0), this.duration);
+    this.currentTime = target;
+    try {
+      p.seek(target);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'video seek failed: %{public}s', JSON.stringify(e));
+    }
+    this.syncSessionState();
+  }
+
   private attachEvents(player: media.AVPlayer): void {
     player.on('stateChange', (state: media.AVPlayerState) => {
       hilog.info(0x0000, 'NasPlayer', 'avplayer stateChange -> %{public}s', state);
@@ -376,10 +646,10 @@ export default struct PlayerPage {
         this.playing = false;
         this.setKeepScreenOn(false);
       } else if (state === 'completed') {
-        this.playing = false;
-        this.completed = true;
-        this.setKeepScreenOn(false);
+        this.onVideoFinished();
+        return;
       }
+      this.syncSessionState();
     });
     player.on('timeUpdate', (time: number) => {
       if (!this.dragging) {
@@ -387,6 +657,11 @@ export default struct PlayerPage {
       }
       if (this.duration === 0) {
         this.duration = player.duration;
+      }
+      const now = Date.now();
+      if (now - this.lastSessionSync >= SESSION_SYNC_INTERVAL_MS) {
+        this.lastSessionSync = now;
+        this.syncSessionState();
       }
     });
     player.on('error', (err: BusinessError) => {
@@ -400,13 +675,41 @@ export default struct PlayerPage {
       }
     });
     player.on('endOfStream', () => {
-      this.completed = true;
+      this.onVideoFinished();
     });
     player.on('videoSizeChange', (width: number, height: number) => {
       if (width > 0 && height > 0) {
         this.updateScale();
       }
     });
+  }
+
+  /** 当前视频播完：去重后延时处理，后台时自动续播下一部，前台维持“播放完成”UI */
+  private onVideoFinished(): void {
+    if (this.destroyed) {
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastFinishAt < 1500) {
+      return;
+    }
+    this.lastFinishAt = now;
+    this.playing = false;
+    this.completed = true;
+    this.setKeepScreenOn(false);
+    this.syncSessionState();
+    if (!this.backgrounded) {
+      return;
+    }
+    const next = this.index + 1;
+    if (next < this.videoFiles.length) {
+      hilog.info(DOMAIN, TAG, 'video finished in background, auto next from=%{public}d', this.index);
+      setTimeout(() => {
+        if (!this.destroyed && this.backgrounded) {
+          this.switchTo(1);
+        }
+      }, 250);
+    }
   }
 
   private waitForState(player: media.AVPlayer, target: media.AVPlayerState, timeoutMs: number): Promise<boolean> {
@@ -508,6 +811,9 @@ export default struct PlayerPage {
       this.errorMsg = '';
       this.loading = false;
       this.scheduleNeighborPrefetch();
+      this.ensureBackgroundTask();
+      this.syncSessionMetadata();
+      this.syncSessionState();
     } catch (e) {
       console.error('play failed: ' + JSON.stringify(e));
       hilog.error(0x0000, 'NasPlayer', 'playEntry failed: %{public}s serveErr=%{public}s',
@@ -666,6 +972,7 @@ export default struct PlayerPage {
       } else {
         hilog.info(0x0000, 'NasPlayer', 'togglePlay: state=%{public}s not operable', st);
       }
+      this.syncSessionState();
     } catch (e) {
       console.error('toggle play failed: ' + JSON.stringify(e));
       hilog.error(0x0000, 'NasPlayer', 'togglePlay failed: %{public}s', JSON.stringify(e));
@@ -679,6 +986,7 @@ export default struct PlayerPage {
       p.setSpeed(this.speedValues[this.speedIdx]);
     }
     this.showControlsTemporarily();
+    this.syncSessionState();
   }
 
   private cycleScale(): void {
@@ -761,6 +1069,28 @@ export default struct PlayerPage {
       clearTimeout(this.hideTimer);
       this.hideTimer = -1;
     }
+  }
+
+  /** 切换“后台播放”开关：落盘；开启时申请后台任务，关闭时释放 */
+  private toggleBgPlay(): void {
+    this.bgPlayEnabled = !this.bgPlayEnabled;
+    const enabled = this.bgPlayEnabled;
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      ConfigStore.saveVideoBgPlay(ctx, enabled).catch((e: BusinessError) => {
+        hilog.warn(DOMAIN, TAG, 'save video bg play failed code=%{public}d', e.code);
+      });
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'save video bg play failed: %{public}s', JSON.stringify(e));
+    }
+    if (enabled) {
+      this.ensureBackgroundTask();
+      this.showToast('后台播放已开启');
+    } else {
+      this.stopBackgroundTask();
+      this.showToast('后台播放已关闭');
+    }
+    this.showControlsTemporarily();
   }
 
   /** 删除当前视频：红色按钮 + 二次确认，避免误触；删除后自动切到下一部 */
@@ -858,6 +1188,7 @@ export default struct PlayerPage {
       p.seek(v);
     }
     this.showControlsTemporarily();
+    this.syncSessionState();
   }
 
   /** 快进/快退：目标位置夹在 [0, duration]，更新进度并提示 */
@@ -877,6 +1208,7 @@ export default struct PlayerPage {
     if (showToast) {
       this.showToast((deltaMs >= 0 ? '+' : '') + (deltaMs / 1000) + 's');
     }
+    this.syncSessionState();
   }
 
   /** 长按半屏：X2 倍速播放（替代高频 seek，避免卡顿）。AVPlayer 不支持倒放，左右统一 X2 倍速 */
@@ -911,6 +1243,16 @@ export default struct PlayerPage {
   @Builder
   actionMenu() {
     Column() {
+      Text(this.bgPlayEnabled ? '后台播放：开' : '后台播放：关')
+        .fontSize(13)
+        .fontColor($r('app.color.text_main'))
+        .textAlign(TextAlign.Center)
+        .width('100%')
+        .padding({ top: 9, bottom: 9 })
+        .onClick(() => {
+          this.actionMenuOpen = false;
+          this.toggleBgPlay();
+        })
       Text('删除')
         .fontSize(13)
         .fontColor($r('app.color.text_error'))
@@ -923,7 +1265,7 @@ export default struct PlayerPage {
         })
       // 后续新增操作项在此追加
     }
-    .width(80)
+    .width(120)
     .backgroundColor($r('app.color.card_bg'))
     .borderRadius(10)
     .shadow({ radius: 12, color: '#26000000', offsetX: 0, offsetY: 4 })
@@ -1207,9 +1549,21 @@ export default struct PlayerPage {
       this.onWillDisappear();
     })
     .onHidden(() => {
-      this.exitLandscape();
-      this.exitFullscreen();
-      this.pauseIfPlaying();
+      this.backgrounded = true;
+      if (this.bgPlayEnabled) {
+        // 后台听视频：不暂停、不做窗口/方向变更，返回前台保持原横竖屏与全屏状态
+        this.syncSessionState();
+      } else {
+        this.exitLandscape();
+        this.exitFullscreen();
+        this.pauseIfPlaying();
+      }
+    })
+    .onShown(() => {
+      this.backgrounded = false;
+      // 退后台期间窗口不可见，常亮可能被系统复位，返回前台重新申请
+      this.setKeepScreenOn(this.playing);
+      this.syncSessionState();
     })
   }
 }
